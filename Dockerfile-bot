@@ -1,0 +1,13 @@
+# Dùng bộ gốc có sẵn playwright và mọi thư viện hệ điều hành
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy toàn bộ code
+COPY . .
+
+# Chạy bot
+CMD ["python", "crawl_callie_bot.py"]
