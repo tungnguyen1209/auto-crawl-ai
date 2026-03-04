@@ -101,13 +101,45 @@ SCROLL_AND_LOAD_JS = """
 (async () => {
     await new Promise(r => setTimeout(r, 2000));
 
+    // Tập hợp chứa TẤT CẢ url sản phẩm thu thập được
+    const allCollectedLinks = new Set();
+    const baseUrl = window.location.origin;
+    const currentPath = window.location.pathname;
+
+    // Hàm xử lý và lưu links trên DOM hiện tại
+    function harvestLinks() {
+        const links = document.querySelectorAll('a[href]');
+        for (let i = 0; i < links.length; i++) {
+            let href = links[i].href;
+            try {
+                href = new URL(href, baseUrl).href.split('?')[0].split('#')[0];
+                if (!href || !href.startsWith(baseUrl)) continue;
+                if (href === baseUrl + currentPath || href === baseUrl + '/') continue;
+                
+                const skip = ['/cart','/account','/login','/register','/search',
+                              '/wishlist','/checkout','/blog','/news','/contact',
+                              '/about','/faq','/shipping','/returns','/privacy',
+                              '/sitemap','/404','.pdf','.jpg','.png','.gif',
+                              'javascript:','mailto:','tel:'];
+                if (skip.some(s => href.includes(s))) continue;
+                
+                const path = new URL(href).pathname;
+                if (path.length > 5 && path !== '/') {
+                    allCollectedLinks.add(href);
+                }
+            } catch(e) { }
+        }
+    }
+
     async function loadAll() {
         let maxTries = 80;
         let count = 0;
-        let lastCount = 0;
+        let lastLinkCount = 0;
+        let stagnateCount = 0;
 
         while (count < maxTries) {
             window.scrollTo(0, document.body.scrollHeight);
+            harvestLinks(); // Thu hoạch link liên tục mỗi lần scroll
             await new Promise(r => setTimeout(r, 1000));
 
             const moreSelectors = [
@@ -129,38 +161,35 @@ SCROLL_AND_LOAD_JS = """
                     break;
                 }
             }
+            
+            // Xoá bớt các DOM Node (Cấu trúc giao diện sản phẩm) để đỡ tràn RAM
+            try {
+                const items = document.querySelectorAll('.product-item, .grid-item, .product-card, li.item');
+                // Giữ lại 40 item cuối cùng để trang web không bị gãy JS
+                if (items.length > 40) {
+                    for (let i = 0; i < items.length - 40; i++) {
+                        items[i].remove();
+                    }
+                }
+            } catch(e) {}
 
-            const allLinks = document.querySelectorAll('a[href]');
-            if (allLinks.length === lastCount && !clicked) break;
-            lastCount = allLinks.length;
+            // Điều kiện thoát nếu không thấy link mới
+            if (allCollectedLinks.size === lastLinkCount && !clicked) {
+                stagnateCount++;
+                if (stagnateCount >= 2) break; // Thử 2 lần không có gì mới thì dừng
+            } else {
+                stagnateCount = 0;
+            }
+            
+            lastLinkCount = allCollectedLinks.size;
             count++;
         }
     }
 
     await loadAll();
+    harvestLinks(); // Thu hoạch lần cuối
 
-    const baseUrl = window.location.origin;
-    const currentPath = window.location.pathname;
-
-    const links = Array.from(document.querySelectorAll('a[href]'))
-        .map(a => {
-            try { return new URL(a.href, baseUrl).href.split('?')[0].split('#')[0]; }
-            catch(e) { return null; }
-        })
-        .filter(href => {
-            if (!href || !href.startsWith(baseUrl)) return false;
-            if (href === baseUrl + currentPath || href === baseUrl + '/') return false;
-            const skip = ['/cart','/account','/login','/register','/search',
-                          '/wishlist','/checkout','/blog','/news','/contact',
-                          '/about','/faq','/shipping','/returns','/privacy',
-                          '/sitemap','/404','.pdf','.jpg','.png','.gif',
-                          'javascript:','mailto:','tel:'];
-            if (skip.some(s => href.includes(s))) return false;
-            const path = new URL(href).pathname;
-            return path.length > 5 && path !== '/';
-        });
-
-    return JSON.stringify([...new Set(links)]);
+    return JSON.stringify([...allCollectedLinks]);
 })()
 """
 
