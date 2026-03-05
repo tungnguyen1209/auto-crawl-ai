@@ -439,10 +439,6 @@ def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CA
 
 
 def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list, categories: int = DEFAULT_CATEGORIES):
-    if url in crawled_urls:
-        with lock:
-            counters["skipped"] += 1
-        return
 
     html = fetch_html(url)
     if not html:
