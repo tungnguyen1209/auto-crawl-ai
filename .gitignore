@@ -298,3 +298,5 @@ scripts/
 *.rdb
 *.ldb
 MEMORY.md
+crawled_urls.txt
+list-urls-callie-*.txt

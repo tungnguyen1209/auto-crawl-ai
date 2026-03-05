@@ -21,10 +21,14 @@ import re
 import time
 import threading
 import requests
+import random
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import litellm
+
+litellm.drop_params = True
 
 from playwright.async_api import async_playwright
 # Mới thêm các thư viện này ở gần phần import trên cùng:
@@ -43,14 +47,22 @@ def dummy_web_server():
 
 load_dotenv(".env")
 
-# ─── Config ──────────────────────────────────────────────────
+# ─── Config & Auto Crawl ──────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8590410345:AAF5Xgq6GT6FHZ0vyfe_SCIjZsq_k1dew1I")
+
+# -- Cấu hình cho Auto Crawl liên tục ---
+AUTO_CRAWL_ENABLED = False # Mặc định tắt, chỉ chạy khi chat /start_auto_crawl
+AUTO_CRAWL_INTERVAL_HOURS = float(os.environ.get("AUTO_CRAWL_INTERVAL_HOURS", "1")) # 1 tiếng vòng quay
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "") # Nhập Chat ID của bạn để cấu hình nhận báo cáo
+
+# (Đã xoá AUTO_CRAWL_LIST do tích hợp AI tự động quét website)
+
 CRAWLED_FILE       = "crawled_urls.txt"
 PRINTERVAL_API     = "https://printerval.com/crawl-product/create-from-html?debug=1"
 USER_EMAIL         = "duytungnguyen.bkhn.95@gmail.com"
 USER_TOKEN         = "4a5747260b5614a86d6fb70f1012ad19"
 BRAND_ID           = 9
-DEFAULT_CATEGORIES = 35   # dùng nếu không truyền trong lệnh
+DEFAULT_CATEGORIES = -1   # -1 để bật AI tự động dự đoán danh mục cho mọi sản phẩm
 COUNTRY_CODE       = "us"
 GENERATE_VARIANT   = 1
 IS_OVERWRITE       = 1
@@ -93,7 +105,113 @@ def add_crawled_url(url):
 
 
 # ══════════════════════════════════════════════════════════════
-# 1. THU THẬP URL SẢN PHẨM (scroll + click more via Crawl4AI)
+# 1. AI CHỌN CATEGORY & TỰ ĐỘNG KHÁM PHÁ WEBSITE
+# ══════════════════════════════════════════════════════════════
+
+def predict_category_with_ai(product_url: str) -> int:
+    """Gọi LLM (Gemini/OpenAI) để phân tích slug URL và tự động chọn Category ID."""
+    try:
+        # Load cache json một lần
+        if not hasattr(predict_category_with_ai, "_cat_json"):
+            with open("us_categories.json", "r", encoding="utf-8") as f:
+                cats = json.load(f)
+            # Rút gọn token để bot đọc nhanh hơn: id, name
+            predict_category_with_ai._cat_json = json.dumps([{"id": c["id"], "name": c["name"]} for c in cats])
+
+        slug = product_url.split("/")[-1].replace("-", " ")
+        prompt = f"""
+Sản phẩm e-commerce (slug/tên): '{slug}'
+Danh sách id + tên danh mục:
+{predict_category_with_ai._cat_json}
+
+Trả về CHỈ một con số nguyên (integer) là `id` của danh mục phù hợp nhất với sản phẩm này. KHÔNG kèm bất kỳ thông báo hay text nào khác. Nếu không có gì thực sự khớp, trả về 35.
+"""
+        model_name = os.environ.get("AI_MODEL_NAME", "gemini/gemini-2.5-flash-lite") # Mặc định dùng Gemini
+        response = litellm.completion(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0,
+            api_key=os.environ.get("GEMINI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+        )
+        # Log toàn bộ response để debug nếu không có content
+        raw_content = None
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            choice = response.choices[0]
+            if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
+                raw_content = choice.message.content
+        
+        if raw_content is not None:
+            content = str(raw_content).strip()
+            match = re.search(r'\d+', content)
+            if match:
+                return int(match.group(0))
+        else:
+            print(f"[AI Category Warn] AI trả về đối tượng không hợp lệ cho URL: {product_url}")
+            print(f"Log từ LiteLLM object: {str(response)}")
+            
+    except Exception as e:
+        print(f"[AI Category Error] {product_url} -> {e}")
+    return 35 # Trả về 35 mặc định nếu cả AI cũng sụp lỗi (fallback an toàn cuối cùng)
+
+
+async def auto_discover_callie_categories() -> list[str]:
+    """Tự động mở trang chủ, tìm các từ khoá hot từ thanh tìm kiếm để crawl"""
+    print("[AUTO CRAWL] Đang mở trang chủ Callie để trích xuất từ khóa tìm kiếm...")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.goto("https://www.callie.com/", wait_until="domcontentloaded", timeout=60000)
+            
+            # Chờ search keywords xuất hiện
+            try:
+                await page.wait_for_selector('.search-hot-keyword', timeout=15000)
+            except Exception as e:
+                print(f"[AUTO CRAWL WARN] Không đợi được selector .search-hot-keyword: {e}")
+                
+            await page.wait_for_timeout(1000)
+            
+            # In HTML ra để người dùng tự debug
+            with open("homepage_debug.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+            print("[AUTO CRAWL] ⚙ Đã ghi HTML trang chủ ra file 'homepage_debug.html' để debug.")
+            
+            # Lấy tất cả text của từ khóa
+            keywords_json = await page.evaluate('''() => {
+                const elems = document.querySelectorAll('.search-hot-keyword');
+                const words = new Set();
+                elems.forEach(el => {
+                    let text = el.textContent.trim();
+                    if (text && text.length > 2) {
+                        words.add(text);
+                    }
+                });
+                return JSON.stringify(Array.from(words));
+            }''')
+            
+            keywords = json.loads(keywords_json)
+        except Exception as e:
+            print(f"[AUTO CRAWL ERR] Lỗi khi quét từ khoá trang chủ: {e}")
+            keywords = []
+        finally:
+            await browser.close()
+    
+    # Ráp thành URL tìm kiếm
+    import urllib.parse
+    valid_categories = []
+    base_search_url = "https://au.callie.com/category/index?search={}"
+    
+    for kw in keywords:
+        encoded_kw = urllib.parse.quote(kw)
+        search_link = base_search_url.format(encoded_kw)
+        valid_categories.append(search_link)
+                
+    random.shuffle(valid_categories)
+    return valid_categories
+
+# ══════════════════════════════════════════════════════════════
+# 2. THU THẬP URL SẢN PHẨM (scroll + click more via Crawl4AI)
 # ══════════════════════════════════════════════════════════════
 
 # JS: scroll hết trang + click nút "more/load more" đến khi hết
@@ -332,7 +450,19 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["failed"] += 1
         return
 
-    result = post_to_printerval(url, html, categories=categories)
+    # Nếu Category được set là -1 (Tự động bởi AI) - Mặc định hiện tại luôn là -1
+    final_category = categories
+    if final_category == -1:
+        final_category = predict_category_with_ai(url)
+        
+    # Bỏ qua không đăng nếu AI trả về giá trị -2
+    if final_category == -2:
+        print(f"[SKIP] Bỏ qua sản phẩm vì kịch bản AI không tìm được Category: {url}")
+        with lock:
+            counters["skipped"] += 1
+        return
+
+    result = post_to_printerval(url, html, categories=final_category)
     
     # --- DEBUG LOG ---
     try:
@@ -371,7 +501,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["failed"] += 1
 
 
-def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES):
+def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, is_auto: bool = False):
     """Chạy import trong background thread với ThreadPoolExecutor"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -387,9 +517,21 @@ def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories:
     active_jobs[chat_id] = job
 
     def send(msg):
-        asyncio.run_coroutine_threadsafe(
-            bot.send_message(chat_id=chat_id, text=msg), loop
-        )
+        if is_auto and not ADMIN_CHAT_ID:
+            print(f"[AUTO MSG] {msg.replace(chr(10), ' | ')}")
+            return
+            
+        target_id = int(str(ADMIN_CHAT_ID).strip()) if is_auto and str(ADMIN_CHAT_ID).strip() else chat_id
+        if target_id == -1:
+            print(f"[AUTO MSG] {msg.replace(chr(10), ' | ')}")
+            return
+            
+        try:
+            asyncio.run_coroutine_threadsafe(
+                bot.send_message(chat_id=target_id, text=msg), loop
+            )
+        except Exception as e:
+            print(f"[LỖI GỬI TIN TELEGRAM] {e}")
 
     last_report = [0]
 
@@ -449,10 +591,12 @@ def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories:
             # 2. Gửi qua Telegram
             bio = io.BytesIO("\n".join(done_links).encode("utf-8"))
             bio.name = file_name
-            try:
-                await bot.send_document(chat_id=chat_id, document=bio, caption=f"Danh sách link sản phẩm đã import ({file_name})")
-            except Exception as e:
-                print(f"Lỗi gửi file: {e}")
+            target_id_for_doc = int(str(ADMIN_CHAT_ID).strip()) if is_auto and str(ADMIN_CHAT_ID).strip() else chat_id
+            if target_id_for_doc != -1:
+                try:
+                    await bot.send_document(chat_id=target_id_for_doc, document=bio, caption=f"Danh sách link sản phẩm đã import ({file_name})")
+                except Exception as e:
+                    print(f"Lỗi gửi file: {e}")
         asyncio.run_coroutine_threadsafe(send_doc(), loop)
 
     active_jobs.pop(chat_id, None)
@@ -467,20 +611,58 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "🤖 *Printerval Import Bot*\n\n"
-        "Gửi link trang *danh sách sản phẩm* — bot sẽ:\n"
-        "1️⃣ Mở browser, scroll & click *Load More* đến hết\n"
-        "2️⃣ Gom toàn bộ link sản phẩm\n"
+        "Gửi *Từ khóa* hoặc *Link danh sách*, bot sẽ:\n"
+        "1️⃣ Mở browser tìm kiếm, scroll & click *Load More* đến hết\n"
+        "2️⃣ Gom toàn bộ link sản phẩm liên quan đến từ khoá\n"
         "3️⃣ Import từng sản phẩm lên *Printerval* (3 luồng song song)\n\n"
         "📌 *Cú pháp:*\n"
-        "`/crawl {url} {category\_id}`\n"
-        "`/crawl {url}` _(dùng category mặc định: 35)_\n\n"
+        "`/crawl {từ khoá} {category\_id}`\n"
+        "`/crawl {từ khoá}` _(dùng category AI: -1 hoặc mặc định)_\n\n"
         "📌 *Ví dụ:*\n"
-        "`/crawl https://example.com/products 33`\n"
-        "`/crawl https://example.com/products 45`\n"
-        "`/crawl https://example.com/products`\n\n"
-        "⚙️ `/status` — tiến độ | `/cancel` — huỷ",
+        "`/crawl Easter Bunny 33`\n"
+        "`/crawl wallet`\n"
+        "`Easter Bunny` hoăc `https://...` (gửi thẳng không cần /crawl)\n\n"
+        "⚙️ `/status` — tiến độ | `/cancel` — huỷ\n"
+        "🤖 `/start_auto_crawl` | `/stop_auto_crawl`",
         parse_mode="Markdown"
     )
+
+
+# Biến giữ tham chiếu đến task chạy ngầm của bot để không tạo task trùng lặp
+_auto_crawl_task = None
+
+async def start_auto_crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_CRAWL_ENABLED, _auto_crawl_task
+    if not update.message:
+        return
+    if AUTO_CRAWL_ENABLED:
+        await update.message.reply_text("⚠️ Auto Crawl hiện đang chạy rồi.")
+        return
+        
+    AUTO_CRAWL_ENABLED = True
+    await update.message.reply_text("✅ Đã BẬT Auto Crawl. Bot sẽ bắt đầu tìm từ khoá tìm kiếm và cào sản phẩm theo vòng lặp.", parse_mode="Markdown")
+    
+    # Khởi chạy Task ngầm nếu chưa có
+    if _auto_crawl_task is None or _auto_crawl_task.done():
+        _auto_crawl_task = asyncio.create_task(auto_crawl_runner(context.bot))
+
+
+async def stop_auto_crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTO_CRAWL_ENABLED, _auto_crawl_task
+    if not update.message:
+        return
+    if not AUTO_CRAWL_ENABLED:
+        await update.message.reply_text("⚠️ Auto Crawl hiện đã TẮT sẵn.")
+        return
+        
+    AUTO_CRAWL_ENABLED = False
+    
+    # Huỷ task nếu nó đang đợi sleep
+    if _auto_crawl_task and not _auto_crawl_task.done():
+        _auto_crawl_task.cancel()
+        _auto_crawl_task = None
+        
+    await update.message.reply_text("⛔ Đã TẮT Auto Crawl. Vòng lặp ngầm đã bị huỷ.", parse_mode="Markdown")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -561,6 +743,11 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
         # Nếu không lọc được, dùng toàn bộ link
         product_urls = all_links
         
+    # Giới hạn số lượng link sản phẩm tối đa (Chống tràn RAM/API Rate Limit)
+    MAX_LINKS_PER_CRAWL = 2000 # <-- Bạn có thể chỉnh lại số này
+    if len(product_urls) > MAX_LINKS_PER_CRAWL:
+        product_urls = product_urls[:MAX_LINKS_PER_CRAWL]
+        
     # Ghi file danh sách urls ngay lập tức
     from urllib.parse import urlparse
     p = urlparse(url)
@@ -577,7 +764,7 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
     await update.message.reply_text(
         f"✅ *Bước 1/3 xong!*\n"
         f"📊 Tổng link tìm thấy: {len(all_links)}\n"
-        f"🎯 Link sản phẩm (sau lọc): *{len(product_urls)}*\n"
+        f"🎯 Lấy {len(product_urls)} sản phẩm để Import (đã giới hạn {MAX_LINKS_PER_CRAWL})\n"
         f"💾 Đã lưu danh sách vào file: `{list_file_name}`\n\n"
         f"🚀 *Bước 2/3:* Bắt đầu import lên Printerval...\n"
         f"_(Báo cáo mỗi 10 sản phẩm)_",
@@ -604,60 +791,59 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
 
 
 async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/crawl {url} [category_id]"""
+    """/crawl {keyword_or_url} [category_id]"""
     if not update.message or not update.message.text:
         return
-    parts = update.message.text.split(maxsplit=2)  # ['/crawl', url, category_id?]
-    if len(parts) < 2:
+    text = update.message.text.replace("/crawl", "", 1).strip()
+    if not text:
         await update.message.reply_text(
-            "❌ Cú pháp: `/crawl {url} {category\_id}`\n"
-            "Ví dụ: `/crawl https://example.com/products 33`",
+            "❌ Cú pháp: `/crawl {từ khoá} {category\_id}`\n"
+            "Ví dụ: `/crawl Easter Bunny 33`\n"
+            "Ví dụ: `/crawl wallet`",
             parse_mode="Markdown"
         )
         return
 
-    url = parts[1].strip()
-    categories = DEFAULT_CATEGORIES
-    if len(parts) >= 3:
-        cat_str = parts[2].strip()
-        if cat_str.isdigit():
-            categories = int(cat_str)
-        else:
-            await update.message.reply_text(
-                f"⚠️ Category ID phải là số nguyên, nhận được: `{cat_str}`\n"
-                f"Dùng category mặc định: `{DEFAULT_CATEGORIES}`",
-                parse_mode="Markdown"
-            )
+    # Check if the last word is a category ID
+    parts = text.rsplit(maxsplit=1)
+    categories = -1  # Default to AI mode
+    if len(parts) == 2 and parts[1].isdigit():
+        categories = int(parts[1])
+        text = parts[0].strip()
+
+    import urllib.parse
+    if text.startswith("http://") or text.startswith("https://"):
+        url = text
+    else:
+        encoded_kw = urllib.parse.quote(text)
+        url = f"https://au.callie.com/category/index?search={encoded_kw}"
+
     await do_crawl(update, context, url, categories=categories)
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gửi URL + category_id trực tiếp (không cần /crawl)"""
+    """Gửi url hoặc từ khoá trực tiếp (không cần /crawl)"""
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
-    parts = text.split(maxsplit=1)
+    if not text:
+        return
 
-    if parts[0].startswith("http://") or parts[0].startswith("https://"):
-        url = parts[0]
-        categories = DEFAULT_CATEGORIES
-        if len(parts) >= 2 and parts[1].strip().isdigit():
-            categories = int(parts[1].strip())
-        elif len(parts) >= 2:
-            await update.message.reply_text(
-                f"⚠️ Tham số thứ 2 phải là category ID (số)\n"
-                f"Dùng category mặc định: `{DEFAULT_CATEGORIES}`",
-                parse_mode="Markdown"
-            )
-        await do_crawl(update, context, url, categories=categories)
+    # Tách category ID ở cuối nếu có
+    parts = text.rsplit(maxsplit=1)
+    categories = -1  # AI dự đoán ID mặc định
+    if len(parts) == 2 and parts[1].isdigit():
+        categories = int(parts[1])
+        text = parts[0].strip()
+
+    import urllib.parse
+    if text.startswith("http://") or text.startswith("https://"):
+        url = text
     else:
-        await update.message.reply_text(
-            "💬 Cú pháp:\n"
-            "`/crawl {url} {category_id}`\n\n"
-            "Hoặc gửi: `{url} {category_id}`\n"
-            "Gõ /start để xem hướng dẫn.",
-            parse_mode="Markdown"
-        )
+        encoded_kw = urllib.parse.quote(text)
+        url = f"https://au.callie.com/category/index?search={encoded_kw}"
+
+    await do_crawl(update, context, url, categories=categories)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -670,6 +856,139 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     print(f"[ERROR] {err}")
     traceback.print_exception(type(err), err, err.__traceback__)
+
+
+async def auto_crawl_runner(bot):
+    """Tiến trình ngầm chạy auto liên tục theo vòng lặp, tự động lấy link kết hợp AI."""
+    print("🔄 Bắt đầu tiến trình nhánh Auto Crawl Runner...")
+    
+    while AUTO_CRAWL_ENABLED:
+        print("\n" + "="*50)
+        print("BẮT ĐẦU VÒNG AUTO CRAWL MỚI - ĐANG TÌM DANH MỤC")
+        print("="*50)
+
+        # KHÔNG DÙNG AUTO_CRAWL_LIST nữa, tự động fetch tất cả từ trang chủ
+        auto_categories = await auto_discover_callie_categories()
+        print(f"[AUTO CRAWL] 🤖 Tìm thấy {len(auto_categories)} danh mục trên trang chủ. Bắt đầu quét...")
+        
+        # Fix lỗi IndexError nếu không tìm thấy link nào thì sleep đợi rồi tìm lại
+        if not auto_categories:
+            print(f"[AUTO CRAWL ERR] ❌ Cảnh báo! Tính năng auto không tìm thấy category nào hợp lệ trên trang chủ.")
+            print(f"Sẽ sleep {AUTO_CRAWL_INTERVAL_HOURS} giờ rồi thử quét trang chủ lại...")
+            await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
+            continue
+            
+        # Chọn thẻ random thay vì duyệt foreach (Tiết kiệm CPU/Ram mỗi giờ chạy 1 link)
+        url = random.choice(auto_categories)
+        
+        print(f"\n[AUTO CRAWL] 🤖 Đã chọn ngẫu nhiên URL danh mục: {url}")
+        
+        # Nếu bot có quyền nhắn tin cho Admin
+        if str(ADMIN_CHAT_ID).strip():
+            try:
+                await bot.send_message(
+                    chat_id=int(str(ADMIN_CHAT_ID).strip()), 
+                    text=f"🔄 *[AUTO CRAWL]* Vòng lặp mới.\nĐã chọn tự động danh mục: {url}\nSẽ tự động crawl trang và dùng AI chọn ID chuyên mục...",
+                    parse_mode="Markdown"
+                )
+            except: pass
+
+        # Category ID -1 là cờ để bật tính năng AI predict lúc đăng SP
+        categories = -1 
+        
+        chat_id = -1
+        if str(ADMIN_CHAT_ID).strip():
+            try:
+                chat_id = int(str(ADMIN_CHAT_ID).strip())
+            except:
+                pass
+        
+        job_id_key = chat_id if chat_id != -1 else -1
+
+        # Nếu user vừa gọi /cancel, dọn job rỗng
+        if job_id_key in active_jobs and active_jobs[job_id_key].get("cancelled"):
+            active_jobs.pop(job_id_key, None)
+            
+            if job_id_key in active_jobs:
+                print(f"[AUTO CRAWL] Đang có job khác chạy cho ID {job_id_key}, bỏ qua và chờ lượt sau...")
+                await asyncio.sleep(60)
+                continue
+                
+        # 1. Thu thập links
+        try:
+            all_links = await collect_product_urls_crawl4ai(url)
+        except Exception as e:
+            print(f"[AUTO CRAWL ERR] Lỗi khi thu thập URL tại {url}: {e}")
+            await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
+            continue
+            
+        product_urls = filter_product_links(all_links, url)
+        if not product_urls:
+            product_urls = all_links
+            
+        if not product_urls:
+            print(f"[AUTO CRAWL] Không tìm thấy link sản phẩm nào cho {url}")
+            await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
+            continue
+            
+        print(f"[AUTO CRAWL] Tìm thấy {len(product_urls)} sản phẩm cho {url}. Bắt đầu gửi qua AI & Import...")
+        
+        # Giới hạn số lượng link sản phẩm tối đa cho bot auto
+        MAX_LINKS_PER_CRAWL = 2000
+        if len(product_urls) > MAX_LINKS_PER_CRAWL:
+            product_urls = product_urls[:MAX_LINKS_PER_CRAWL]
+        
+        if chat_id != -1:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id, 
+                    text=f"🔄 *[AUTO CRAWL]* Quét danh mục mới:\n`{url}`\nTìm thấy: {len(product_urls)} SP (Giới hạn {MAX_LINKS_PER_CRAWL}).\n⚡ Dùng AI để khớp `category`.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                pass
+
+        loop = asyncio.get_running_loop()
+        active_jobs[job_id_key] = {
+            "url": url,
+            "categories": "AI Mode",
+            "total": len(product_urls),
+            "start_time": time.time(),
+            "cancelled": False,
+            "counters": {"done": 0, "failed": 0, "skipped": 0},
+        }
+        
+        thread = threading.Thread(
+            target=run_import_job,
+            args=(product_urls, job_id_key, loop, bot, categories, True),
+            daemon=True
+        )
+        thread.start()
+        
+        # Đợi job chạy xong
+        while job_id_key in active_jobs:
+            if active_jobs[job_id_key].get("cancelled"):
+                break
+            await asyncio.sleep(5)
+            
+        print(f"[AUTO CRAWL] Xong vòng lập hiện tại.")
+
+        if str(ADMIN_CHAT_ID).strip():
+            try:
+                await bot.send_message(
+                    chat_id=int(str(ADMIN_CHAT_ID).strip()), 
+                    text=f"🏁 *[AUTO CRAWL]* Đã hoàn tất job tự động hiện tại!\nSẽ tìm Category khác & Crawl tiếp sau {AUTO_CRAWL_INTERVAL_HOURS} giờ.",
+                    parse_mode="Markdown"
+                )
+            except: pass
+            
+        try:
+            await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
+        except asyncio.CancelledError:
+            print("[AUTO CRAWL] ⏹️ Tiến trình sleep đã bị ngắt do người dùng TẮT Auto Crawl.")
+            break
+            
+    print("[AUTO CRAWL] ⏹️ Tiến trình Runner đã kết thúc.")
 
 
 def main():
@@ -687,6 +1006,8 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("crawl",  crawl_command))
+    app.add_handler(CommandHandler("start_auto_crawl", start_auto_crawl_command))
+    app.add_handler(CommandHandler("stop_auto_crawl", stop_auto_crawl_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_error_handler(error_handler)
 
