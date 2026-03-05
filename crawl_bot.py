@@ -200,7 +200,7 @@ async def auto_discover_callie_categories() -> list[str]:
     # Ráp thành URL tìm kiếm
     import urllib.parse
     valid_categories = []
-    base_search_url = "https://au.callie.com/category/index?search={}"
+    base_search_url = "https://callie.com/category/index?search={}"
     
     for kw in keywords:
         encoded_kw = urllib.parse.quote(kw)
@@ -816,7 +816,7 @@ async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = text
     else:
         encoded_kw = urllib.parse.quote(text)
-        url = f"https://au.callie.com/category/index?search={encoded_kw}"
+        url = f"https://callie.com/category/index?search={encoded_kw}"
 
     await do_crawl(update, context, url, categories=categories)
 
@@ -841,7 +841,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         url = text
     else:
         encoded_kw = urllib.parse.quote(text)
-        url = f"https://au.callie.com/category/index?search={encoded_kw}"
+        url = f"https://callie.com/category/index?search={encoded_kw}"
 
     await do_crawl(update, context, url, categories=categories)
 
