@@ -322,54 +322,76 @@ SCROLL_AND_LOAD_JS = """
 async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     """
     Dùng Playwright để scroll, click 'more' và gom toàn bộ link.
+    Đối với trang hỗ trợ phân trang (như allegro), vòng lặp sẽ chạy qua nhiều trang.
     """
+    import re
+    all_extracted_links = set()
+    is_allegro = "allegro.pl" in listing_url or "allegro" in listing_url
+    pages_to_crawl = 5 if is_allegro else 1
+    
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
-        await page.goto(listing_url, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(2000)
+        for page_num in range(1, pages_to_crawl + 1):
+            current_url = listing_url
+            if is_allegro:
+                # Xoá param p= cũ nếu có để tránh trùng lặp
+                base_url_clean = re.sub(r'([?&])p=\d+', '', listing_url)
+                sep = "&" if "?" in base_url_clean else "?"
+                current_url = f"{base_url_clean}{sep}p={page_num}"
+                print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
 
-        # Scroll + click more nhiều lần
-        max_tries = 60
-        last_count = 0
-        for _ in range(max_tries):
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1000)
+            try:
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(2000)
+            except Exception as e:
+                print(f"[CRAWL ERR] Lỗi load URL {current_url}: {e}")
+                continue
 
-            more_selectors = [
-                '.more.btn', '.btn-more', '.load-more', '.loadmore',
-                '[data-action="more"]', 'button.more', 'a.more',
-                '.see-more', '.btn-loadmore', '.pagination__next',
-                '.next-page', '[class*="load-more"]', '[class*="show-more"]',
-                '[class*="loadMore"]', '[class*="see-more"]',
-            ]
-            clicked = False
-            for sel in more_selectors:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=500):
-                        await btn.click()
-                        await page.wait_for_timeout(2000)
-                        clicked = True
-                        break
-                except Exception:
-                    pass
+            # Scroll + click more nhiều lần
+            max_tries = 60 if not is_allegro else 15
+            last_count = 0
+            for _ in range(max_tries):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
 
-            # Nếu không click được và số link không tăng → dừng
-            cur_count = await page.evaluate("document.querySelectorAll('a[href]').length")
-            if cur_count == last_count and not clicked:
-                break
-            last_count = cur_count
+                more_selectors = [
+                    '.more.btn', '.btn-more', '.load-more', '.loadmore',
+                    '[data-action="more"]', 'button.more', 'a.more',
+                    '.see-more', '.btn-loadmore', '.pagination__next',
+                    '.next-page', '[class*="load-more"]', '[class*="show-more"]',
+                    '[class*="loadMore"]', '[class*="see-more"]',
+                ]
+                clicked = False
+                for sel in more_selectors:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=500):
+                            await btn.click()
+                            await page.wait_for_timeout(2000)
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
 
-        # Lấy tất cả link
-        links_json = await page.evaluate(SCROLL_AND_LOAD_JS)
+                # Nếu không click được và số link không tăng → dừng scroll trang hiện tại
+                cur_count = await page.evaluate("document.querySelectorAll('a[href]').length")
+                if cur_count == last_count and not clicked:
+                    break
+                last_count = cur_count
+
+            # Lấy tất cả link trang này
+            links_json = await page.evaluate(SCROLL_AND_LOAD_JS)
+            try:
+                parsed = json.loads(links_json)
+                all_extracted_links.update(parsed)
+            except Exception:
+                pass
+
         await browser.close()
 
-    try:
-        return json.loads(links_json)
-    except Exception:
-        return []
+    return list(all_extracted_links)
 
 
 def get_base_url(url: str) -> str:
