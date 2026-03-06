@@ -84,6 +84,13 @@ HEADERS_API = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 }
 
+SEARCH_URL_MAP = {
+    "callie": "https://callie.com/category/index?search={}",
+    "allegro": "https://allegro.pl/listing?string={}",
+    "amazon": "https://www.amazon.com/s?k={}",
+    "etsy": "https://www.etsy.com/search?q={}",
+}
+
 # ─── Job tracking ─────────────────────────────────────────────
 active_jobs: dict[int, dict] = {}  # chat_id → job info
 
@@ -200,7 +207,7 @@ async def auto_discover_callie_categories() -> list[str]:
     # Ráp thành URL tìm kiếm
     import urllib.parse
     valid_categories = []
-    base_search_url = "https://callie.com/category/index?search={}"
+    base_search_url = SEARCH_URL_MAP.get("callie", "https://callie.com/category/index?search={}")
     
     for kw in keywords:
         encoded_kw = urllib.parse.quote(kw)
@@ -370,29 +377,98 @@ def get_base_url(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
-def filter_product_links(links: list[str], listing_url: str) -> list[str]:
+def filter_product_links(links: list[str], listing_url: str, website: str = "callie.com") -> list[str]:
     """
     Lọc để chỉ giữ link có khả năng là sản phẩm.
-    Đặc thù web Callie: link sản phẩm có slug bắt đầu bằng "/personalized"
+    Hỗ trợ rule tĩnh cho một số trang đã biết, và rule heuristic động cho các trang bất kì.
     """
+    from collections import Counter
+    from urllib.parse import urlparse
+    
     base = get_base_url(listing_url)
     listing_path = urlparse(listing_url).path.rstrip("/")
+    if not website:
+        website = base
 
     product_links = []
+    
+    # Từ khóa nhận diện các trang cấu trúc/chức năng (không phải trang sản phẩm)
+    skip_keywords = [
+        '/category', '/categories', '/collection', '/collections', '/search', 
+        '/pages/', '/about', '/contact', '/policy', '/terms', '/privacy', 
+        '/cart', '/checkout', '/account', '/login', '/register', '/faq', 
+        '/blog', '/news', '/help', '/shipping', '/returns', '/sitemap'
+    ]
 
     for link in links:
-        # Bỏ qua nếu là link trang hiện tại
-        link_path = urlparse(link).path.rstrip("/")
+        parsed = urlparse(link)
+        link_path = parsed.path.rstrip("/")
+        
+        # Bỏ qua nếu là link trang hiện tại, trống hoặc không nằm trên cùng domain
         if link_path == listing_path or link_path == "":
             continue
         if not link.startswith(base):
             continue
 
-        # Chỉ lấy slug bắt đầu bằng /personalized
-        if link_path.startswith('/personalized'):
+        link_lower = link.lower()
+        
+        # --- Rule đặc thù cho các trang cố định ---
+        if "callie" in website.lower() or "callie.com" in base:
+            if link_path.startswith('/personalized'):
+                product_links.append(link)
+            continue
+            
+        if "allegro" in website.lower() or "allegro.pl" in base:
+            if "/oferta/" in link_lower or "/produkt/" in link_lower:
+                product_links.append(link)
+            continue
+            
+        if "amazon" in website.lower() or "amazon.com" in base:
+            if "/dp/" in link_lower or "/gp/product/" in link_lower:
+                product_links.append(link)
+            continue
+            
+        if "etsy" in website.lower() or "etsy.com" in base:
+            if "/listing/" in link_lower:
+                product_links.append(link)
+            continue
+
+        # --- Generic Heuristic cho MỌI WEBSITE khác ---
+        # 1. Bỏ qua các đường dẫn chức năng / danh mục
+        if any(skip_kw in link_lower for skip_kw in skip_keywords):
+            continue
+            
+        # 2. Heuristic độ dài: Slug sản phẩm đa phần khác biệt và dài hơn 5 kí tự
+        if len(link_path) > 5 and link_path.count('/') > 0:
             product_links.append(link)
 
-    return list(dict.fromkeys(product_links))
+    # 3. Lọc trùng URL và xoá query parameters không cần thiết
+    unique_links = list(dict.fromkeys(product_links))
+    
+    is_known_site = any(x in website.lower() for x in ["callie", "allegro", "amazon", "etsy"])
+    
+    # 4. Phân tích cụm cấu trúc phổ biến nhất (Smart Grouping Heuristic)
+    # Tại trang tìm kiếm, các link sản phẩm xuất hiện phần lớn và cùng cấu trúc path.
+    if not is_known_site and len(unique_links) > 10:
+        # Gom nhóm dựa theo cấu trúc cha (base directory của từng link)
+        path_groups = Counter()
+        for link in unique_links:
+            path = urlparse(link).path
+            base_dir = "/".join(path.split("/")[:-1]) # /products/ao-thun -> /products
+            path_groups[base_dir] += 1
+            
+        valid_links = []
+        for link in unique_links:
+            path = urlparse(link).path
+            base_dir = "/".join(path.split("/")[:-1])
+            # Chỉ lấy các cấu trúc lập lại ít nhất 3 lần để loại trừ link mồ côi
+            if path_groups[base_dir] >= 3: 
+                valid_links.append(link)
+                
+        if valid_links:
+            return valid_links
+
+    return unique_links
 
 
 # ══════════════════════════════════════════════════════════════
@@ -412,11 +488,14 @@ def fetch_html(url: str, retries: int = 3) -> str | None:
     return None
 
 
-def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CATEGORIES) -> dict:
+def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CATEGORIES, market: str = "us") -> dict:
+    # Chèn biến market vào sau printerval.com
+    api_url = PRINTERVAL_API.replace("printerval.com", f"printerval.com/{market}")
+
     payload = {
         "brand_id": BRAND_ID,
         "categories": categories,
-        "country_code": COUNTRY_CODE,
+        "country_code": market,
         "generate_variant": GENERATE_VARIANT,
         "html": html,
         "is_overwrite_product": IS_OVERWRITE,
@@ -428,7 +507,7 @@ def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CA
     }
     for i in range(3):
         try:
-            r = requests.post(PRINTERVAL_API, json=payload, headers=HEADERS_API, timeout=120)
+            r = requests.post(api_url, json=payload, headers=HEADERS_API, timeout=120)
             is_json = "application/json" in r.headers.get("content-type", "")
             return {"status": r.status_code, "body": r.json() if is_json else r.text[:300]}
         except Exception as e:
@@ -438,7 +517,7 @@ def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CA
     return {"status": 0, "body": "max retries"}
 
 
-def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list, categories: int = DEFAULT_CATEGORIES):
+def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list, categories: int = DEFAULT_CATEGORIES, market: str = "us"):
 
     html = fetch_html(url)
     if not html:
@@ -458,7 +537,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["skipped"] += 1
         return
 
-    result = post_to_printerval(url, html, categories=final_category)
+    result = post_to_printerval(url, html, categories=final_category, market=market)
     
     # --- DEBUG LOG ---
     try:
@@ -497,7 +576,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["failed"] += 1
 
 
-def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, is_auto: bool = False):
+def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, market: str = "us", is_auto: bool = False):
     """Chạy import trong background thread với ThreadPoolExecutor"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -534,7 +613,7 @@ def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories:
     def worker(url: str):
         if active_jobs.get(chat_id, {}).get("cancelled"):
             return
-        process_one(url, counters, lock, done_links, categories=categories)
+        process_one(url, counters, lock, done_links, categories=categories, market=market)
         done_now = counters["done"] + counters["failed"] + counters["skipped"]
         # Báo cáo mỗi 10 SP hoặc lúc hoàn thành
         if done_now - last_report[0] >= 10 or done_now == total:
@@ -609,15 +688,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Printerval Import Bot*\n\n"
         "Gửi *Từ khóa* hoặc *Link danh sách*, bot sẽ:\n"
         "1️⃣ Mở browser tìm kiếm, scroll & click *Load More* đến hết\n"
-        "2️⃣ Gom toàn bộ link sản phẩm liên quan đến từ khoá\n"
-        "3️⃣ Import từng sản phẩm lên *Printerval* (3 luồng song song)\n\n"
+        "2️⃣ Gom toàn bộ link sản phẩm\n"
+        "3️⃣ Import từng sản phẩm lên *Printerval*\n\n"
         "📌 *Cú pháp:*\n"
-        "`/crawl {từ khoá} {category\_id}`\n"
-        "`/crawl {từ khoá}` _(dùng category AI: -1 hoặc mặc định)_\n\n"
+        "`/crawl {từ khoá/url} [category_id] [website] [market]`\n"
+        "_(Các tham số đằng sau từ khóa/url là tuỳ chọn)_\n\n"
         "📌 *Ví dụ:*\n"
-        "`/crawl Easter Bunny 33`\n"
-        "`/crawl wallet`\n"
-        "`Easter Bunny` hoăc `https://...` (gửi thẳng không cần /crawl)\n\n"
+        "`/crawl https://allegro.pl/listing us`\n"
+        "`/crawl Easter Bunny 33 allegro.pl pl`\n"
+        "`/crawl wallet` (mặc định crawl callie.com vào market us)\n\n"
         "⚙️ `/status` — tiến độ | `/cancel` — huỷ\n"
         "🤖 `/start_auto_crawl` | `/stop_auto_crawl`",
         parse_mode="Markdown"
@@ -698,7 +777,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Không có job nào đang chạy.")
 
 
-async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES):
+async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES, website: str = "callie.com", market: str = "us"):
     """Logic chính: nhận URL → crawl → import"""
     chat_id = update.effective_chat.id
 
@@ -715,7 +794,9 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
 
     await update.message.reply_text(
         f"🌐 URL: `{url}`\n"
-        f"🗂️ Category ID: `{categories}`\n\n"
+        f"🗂️ Category ID: `{categories}`\n"
+        f"🌍 Website logic: `{website}`\n"
+        f"🇺🇸 Market: `{market}`\n\n"
         f"⏳ *Bước 1/3:* Đang mở browser & scroll trang...\n"
         f"_(Có thể mất 1-2 phút nếu trang có nhiều sản phẩm)_",
         parse_mode="Markdown"
@@ -733,7 +814,7 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
         return
 
     # Bước 2: Lọc link sản phẩm
-    product_urls = filter_product_links(all_links, url)
+    product_urls = filter_product_links(all_links, url, website)
 
     if not product_urls:
         # Nếu không lọc được, dùng toàn bộ link
@@ -780,41 +861,88 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
 
     thread = threading.Thread(
         target=run_import_job,
-        args=(product_urls, chat_id, loop, context.bot, categories),
+        kwargs={
+            "product_urls": product_urls,
+            "chat_id": chat_id,
+            "loop": loop,
+            "bot": context.bot,
+            "categories": categories,
+            "market": market,
+            "is_auto": False
+        },
         daemon=True
     )
     thread.start()
 
 
+def parse_command_args(text: str):
+    parts = text.split()
+    market = "us"
+    website = "callie.com"
+    categories = -1
+    
+    found_market = False
+    found_website = False
+    found_category = False
+
+    while len(parts) > 1:
+        last = parts[-1].lower()
+        if not found_market and len(last) == 2 and last.isalpha():
+            market = last
+            found_market = True
+            parts.pop()
+        elif not found_category and (last.isdigit() or (last.startswith('-') and last[1:].isdigit())):
+            categories = int(last)
+            found_category = True
+            parts.pop()
+        elif not found_website and ('.' in last or last.startswith('http')):
+            website = last
+            found_website = True
+            parts.pop()
+        else:
+            break
+
+    keyword_or_url = " ".join(parts).strip()
+    return keyword_or_url, categories, website, market
+
+
+def build_crawling_url(keyword_or_url: str, website: str) -> (str, str):
+    if keyword_or_url.startswith("http://") or keyword_or_url.startswith("https://"):
+        return keyword_or_url, keyword_or_url
+    
+    import urllib.parse
+    encoded_kw = urllib.parse.quote(keyword_or_url)
+    
+    # Tìm link map tương ứng với tên website bằng list comprehension
+    matched_key = next((key for key in SEARCH_URL_MAP.keys() if key in website.lower()), None)
+    
+    if matched_key:
+        url = SEARCH_URL_MAP[matched_key].format(encoded_kw)
+    else:
+        # Fallback nếu không khớp map
+        base_site = website if website.startswith("http") else f"https://{website}"
+        url = f"{base_site}/search?q={encoded_kw}"
+        
+    return url, website
+
 async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/crawl {keyword_or_url} [category_id]"""
+    """/crawl {keyword_or_url} [category_id] [website] [market]"""
     if not update.message or not update.message.text:
         return
     text = update.message.text.replace("/crawl", "", 1).strip()
     if not text:
         await update.message.reply_text(
-            "❌ Cú pháp: `/crawl {từ khoá} {category\_id}`\n"
-            "Ví dụ: `/crawl Easter Bunny 33`\n"
-            "Ví dụ: `/crawl wallet`",
+            "❌ Cú pháp: `/crawl {từ khoá/url} [category_id] [website] [market]`\n"
+            "Ví dụ: `/crawl Easter Bunny 33 callie.com us`\n"
+            "Ví dụ: `/crawl https://allegro.pl/listing uk`",
             parse_mode="Markdown"
         )
         return
 
-    # Check if the last word is a category ID
-    parts = text.rsplit(maxsplit=1)
-    categories = -1  # Default to AI mode
-    if len(parts) == 2 and parts[1].isdigit():
-        categories = int(parts[1])
-        text = parts[0].strip()
+    keyword_or_url, categories, website, market = parse_command_args(text)
+    url, website = build_crawling_url(keyword_or_url, website)
 
-    import urllib.parse
-    if text.startswith("http://") or text.startswith("https://"):
-        url = text
-    else:
-        encoded_kw = urllib.parse.quote(text)
-        url = f"https://callie.com/category/index?search={encoded_kw}"
-
-    await do_crawl(update, context, url, categories=categories)
+    await do_crawl(update, context, url, categories=categories, website=website, market=market)
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -825,21 +953,10 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text:
         return
 
-    # Tách category ID ở cuối nếu có
-    parts = text.rsplit(maxsplit=1)
-    categories = -1  # AI dự đoán ID mặc định
-    if len(parts) == 2 and parts[1].isdigit():
-        categories = int(parts[1])
-        text = parts[0].strip()
+    keyword_or_url, categories, website, market = parse_command_args(text)
+    url, website = build_crawling_url(keyword_or_url, website)
 
-    import urllib.parse
-    if text.startswith("http://") or text.startswith("https://"):
-        url = text
-    else:
-        encoded_kw = urllib.parse.quote(text)
-        url = f"https://callie.com/category/index?search={encoded_kw}"
-
-    await do_crawl(update, context, url, categories=categories)
+    await do_crawl(update, context, url, categories=categories, website=website, market=market)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -956,7 +1073,15 @@ async def auto_crawl_runner(bot):
         
         thread = threading.Thread(
             target=run_import_job,
-            args=(product_urls, job_id_key, loop, bot, categories, True),
+            kwargs={
+                "product_urls": product_urls,
+                "chat_id": job_id_key,
+                "loop": loop,
+                "bot": bot,
+                "categories": categories,
+                "market": "us",
+                "is_auto": True
+            },
             daemon=True
         )
         thread.start()
