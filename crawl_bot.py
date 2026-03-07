@@ -993,7 +993,7 @@ def parse_command_args(text: str):
     found_website = False
     found_category = False
 
-    while len(parts) > 1:
+    while len(parts) > 0:
         last = parts[-1].lower()
         if not found_market and len(last) == 2 and last.isalpha():
             market = last
@@ -1003,7 +1003,7 @@ def parse_command_args(text: str):
             categories = int(last)
             found_category = True
             parts.pop()
-        elif not found_website and ('.' in last or last.startswith('http') or any(k in last for k in SEARCH_URL_MAP.keys())):
+        elif not found_website and ('.' in last or last.startswith('http') or last in SEARCH_URL_MAP):
             website = last
             found_website = True
             parts.pop()
