@@ -89,6 +89,7 @@ SEARCH_URL_MAP = {
     "allegro": "https://allegro.pl/listing?string={}",
     "amazon": "https://www.amazon.com/s?k={}",
     "etsy": "https://www.etsy.com/search?q={}",
+    "redbubble": "https://www.redbubble.com/shop?query={}",
 }
 
 # ─── Job tracking ─────────────────────────────────────────────
@@ -162,7 +163,7 @@ Trả về CHỈ một con số nguyên (integer) là `id` của danh mục phù
     return 35 # Trả về 35 mặc định nếu cả AI cũng sụp lỗi (fallback an toàn cuối cùng)
 
 
-async def auto_discover_callie_categories() -> list[str]:
+async def auto_discover_callie_categories(website: str = "callie.com") -> list[str]:
     """Tự động gọi API hunter.printerval.com để lấy các từ khoá tìm kiếm"""
     print("[AUTO CRAWL] Đang lấy từ khóa từ API hunter.printerval.com...")
     
@@ -237,11 +238,18 @@ async def auto_discover_callie_categories() -> list[str]:
     # Ráp thành URL tìm kiếm
     import urllib.parse
     valid_categories = []
-    base_search_url = SEARCH_URL_MAP.get("callie", "https://callie.com/category/index?search={}")
+    
+    # Xác định hàm build URL theo chuẩn của script (sử dụng SEARCH_URL_MAP)
+    matched_key = next((key for key in SEARCH_URL_MAP.keys() if key in website.lower()), None)
     
     for kw in keywords:
         encoded_kw = urllib.parse.quote(str(kw))
-        search_link = base_search_url.format(encoded_kw)
+        if matched_key:
+            search_link = SEARCH_URL_MAP[matched_key].format(encoded_kw)
+        else:
+            base_site = website if website.startswith("http") else f"https://{website}"
+            search_link = f"{base_site}/search?q={encoded_kw}"
+            
         valid_categories.append(search_link)
                 
     random.shuffle(valid_categories)
@@ -516,6 +524,11 @@ def filter_product_links(links: list[str], listing_url: str, website: str = "cal
             if "/listing/" in link_lower:
                 product_links.append(link)
             continue
+            
+        if "redbubble" in website.lower() or "redbubble.com" in base:
+            if "/i/" in link_lower:
+                product_links.append(link)
+            continue
 
         # --- Generic Heuristic cho MỌI WEBSITE khác ---
         # 1. Bỏ qua các đường dẫn chức năng / danh mục
@@ -529,7 +542,7 @@ def filter_product_links(links: list[str], listing_url: str, website: str = "cal
     # 3. Lọc trùng URL và xoá query parameters không cần thiết
     unique_links = list(dict.fromkeys(product_links))
     
-    is_known_site = any(x in website.lower() for x in ["callie", "allegro", "amazon", "etsy"])
+    is_known_site = any(x in website.lower() for x in ["callie", "allegro", "amazon", "etsy", "redbubble"])
     
     # 4. Phân tích cụm cấu trúc phổ biến nhất (Smart Grouping Heuristic)
     # Tại trang tìm kiếm, các link sản phẩm xuất hiện phần lớn và cùng cấu trúc path.
@@ -798,12 +811,23 @@ async def start_auto_crawl_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("⚠️ Auto Crawl hiện đang chạy rồi.")
         return
         
+    text = update.message.text.replace("/start_auto_crawl", "", 1).strip()
+    
+    # Tính năng mới: Truyền text rỗng vào để lấy arguments args
+    # VD: /start_auto_crawl etsy us
+    _, _categories, website, market = parse_command_args(text if text else "")
+
     AUTO_CRAWL_ENABLED = True
-    await update.message.reply_text("✅ Đã BẬT Auto Crawl. Bot sẽ bắt đầu tìm từ khoá tìm kiếm và cào sản phẩm theo vòng lặp.", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ Đã BẬT Auto Crawl!\n"
+        f"🌍 Website logic: `{website}`\n"
+        f"🇺🇸 Market: `{market}`\n"
+        f"Bot sẽ tự động fetch keywords từ API theo vòng lặp ngầm.", parse_mode="Markdown"
+    )
     
     # Khởi chạy Task ngầm nếu chưa có
     if _auto_crawl_task is None or _auto_crawl_task.done():
-        _auto_crawl_task = asyncio.create_task(auto_crawl_runner(context.bot))
+        _auto_crawl_task = asyncio.create_task(auto_crawl_runner(context.bot, website, market))
 
 
 async def stop_auto_crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1055,22 +1079,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     traceback.print_exception(type(err), err, err.__traceback__)
 
 
-async def auto_crawl_runner(bot):
+async def auto_crawl_runner(bot, website: str = "callie.com", market: str = "us"):
     """Tiến trình ngầm chạy auto liên tục theo vòng lặp, tự động lấy link kết hợp AI."""
     print("🔄 Bắt đầu tiến trình nhánh Auto Crawl Runner...")
+    print(f"🌍 Cấu hình Market: {market} | Website: {website}")
     
     while AUTO_CRAWL_ENABLED:
         print("\n" + "="*50)
-        print("BẮT ĐẦU VÒNG AUTO CRAWL MỚI - ĐANG TÌM DANH MỤC")
+        print(f"BẮT ĐẦU VÒNG AUTO CRAWL MỚI [{website} - {market}]")
         print("="*50)
 
-        # KHÔNG DÙNG AUTO_CRAWL_LIST nữa, tự động fetch tất cả từ trang chủ
-        auto_categories = await auto_discover_callie_categories()
-        print(f"[AUTO CRAWL] 🤖 Tìm thấy {len(auto_categories)} danh mục trên trang chủ. Bắt đầu quét...")
+        # Truyền tham số website vào hàm tạo keywords
+        auto_categories = await auto_discover_callie_categories(website)
+        print(f"[AUTO CRAWL] 🤖 Tìm thấy {len(auto_categories)} URL search ngẫu nhiên. Bắt đầu quét...")
         
         # Fix lỗi IndexError nếu không tìm thấy link nào thì sleep đợi rồi tìm lại
         if not auto_categories:
-            print(f"[AUTO CRAWL ERR] ❌ Cảnh báo! Tính năng auto không tìm thấy category nào hợp lệ trên trang chủ.")
+            print(f"[AUTO CRAWL ERR] ❌ Cảnh báo! Tính năng auto không tạo được url search nào.")
             print(f"Sẽ sleep {AUTO_CRAWL_INTERVAL_HOURS} giờ rồi thử quét trang chủ lại...")
             await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
             continue
@@ -1085,7 +1110,7 @@ async def auto_crawl_runner(bot):
             try:
                 await bot.send_message(
                     chat_id=int(str(ADMIN_CHAT_ID).strip()), 
-                    text=f"🔄 *[AUTO CRAWL]* Vòng lặp mới.\nĐã chọn tự động danh mục: {url}\nSẽ tự động crawl trang và dùng AI chọn ID chuyên mục...",
+                    text=f"🔄 *[AUTO CRAWL]* Vòng lặp mới ({website}-{market}).\nĐã chọn tự động danh mục: {url}\nSẽ tự động crawl trang và dùng AI chọn ID chuyên mục...",
                     parse_mode="Markdown"
                 )
             except: pass
@@ -1119,7 +1144,7 @@ async def auto_crawl_runner(bot):
             await asyncio.sleep(AUTO_CRAWL_INTERVAL_HOURS * 3600)
             continue
             
-        product_urls = filter_product_links(all_links, url)
+        product_urls = filter_product_links(all_links, url, website)
         if not product_urls:
             product_urls = all_links
             
@@ -1163,7 +1188,7 @@ async def auto_crawl_runner(bot):
                 "loop": loop,
                 "bot": bot,
                 "categories": categories,
-                "market": "us",
+                "market": market,
                 "is_auto": True
             },
             daemon=True
