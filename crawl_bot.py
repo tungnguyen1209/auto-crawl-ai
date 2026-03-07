@@ -1003,7 +1003,7 @@ def parse_command_args(text: str):
             categories = int(last)
             found_category = True
             parts.pop()
-        elif not found_website and ('.' in last or last.startswith('http')):
+        elif not found_website and ('.' in last or last.startswith('http') or any(k in last for k in SEARCH_URL_MAP.keys())):
             website = last
             found_website = True
             parts.pop()
