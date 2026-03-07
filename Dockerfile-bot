@@ -3,14 +3,17 @@ FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 WORKDIR /app
 
-# Cài đặt nano và dọn dẹp bộ nhớ đệm để giảm dung lượng image
+# Cài đặt công cụ và dọn dẹp bộ nhớ đệm
 RUN apt-get update && apt-get install -y nano && rm -rf /var/lib/apt/lists/*
 
+# Copy file requirements trước để tận dụng Docker Cache cho dependencies
 COPY requirements.txt .
-RUN pip install -r requirements.txt
-RUN playwright install chromium
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy toàn bộ code
+# Base image playwright/python:v1.49.0-jammy ĐÃ CÓ SẴN các trình duyệt nên KHÔNG CẦN CHẠY LẠI cài đặt browser
+# Bạn sẽ bỏ câu lệnh `RUN playwright install chromium` đi để tiết kiệm 300-500MB download và thời gian chờ
+
+# Copy toàn bộ source code
 COPY . .
 
 # Chạy bot
