@@ -163,46 +163,76 @@ Trả về CHỈ một con số nguyên (integer) là `id` của danh mục phù
 
 
 async def auto_discover_callie_categories() -> list[str]:
-    """Tự động mở trang chủ, tìm các từ khoá hot từ thanh tìm kiếm để crawl"""
-    print("[AUTO CRAWL] Đang mở trang chủ Callie để trích xuất từ khóa tìm kiếm...")
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto("https://www.callie.com/", wait_until="domcontentloaded", timeout=60000)
-            
-            # Chờ search keywords xuất hiện
+    """Tự động gọi API hunter.printerval.com để lấy các từ khoá tìm kiếm"""
+    print("[AUTO CRAWL] Đang lấy từ khóa từ API hunter.printerval.com...")
+    
+    url = 'https://hunter.printerval.com/api/research'
+    headers = {
+        'accept': '*/*',
+        'accept-language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
+        'content-type': 'application/json',
+        'origin': 'https://hunter.printerval.com',
+        'referer': 'https://hunter.printerval.com/',
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+        'cookie': '_ga=GA1.1.1689186747.1768273138; _fbp=fb.1.1768273138375.890768100260677978; _scid=jO68HZP1ddMoJaFXVjCWvJPzeJBVfZ5I; _tt_enable_cookie=1; _ttp=01KETMNNNPNDDG2WJCYK8PRED4_.tt.1; __stripe_mid=bd7d6d95-d461-44c4-9895-e3c9bae8bc0f3f63f8; _pin_unauth=dWlkPVlqZzJPVEF6WldNdE1tRm1NaTAwTlRJNExXSm1NVEV0TWpSaE1qQXhNR0ZsWmpNeQ; datadome=n4z9uT~vEVeB43IHlvj5dQw2EgAnYQxhwVs2KFszA_v8taz2sWnfA2gB3ejBLPzo0gf887O2f3ejFvVgV4fuWpWXqXSdnSWbsMXGGbea5P~q31qWOIMFC7gPouo7FsJv; AwinChannelCookie=direct; _yjsu_yjad=1772174112.650d136e-92d9-4af9-953f-89ce8b1e5ac7; _twpid=tw.1772417673199.691840371330915802; _sctr=1%7C1772384400000; _ScCbts=%5B%5D; _gcl_au=1.1.224713083.1768273138.1327437920.1772439042.1772439169; _cfuvid=uV8CFXJ3HjQRmxTOlaleXjvg_31Gb7.2HleUBxH4Sv8-1772778976500-0.0.1.1-604800000; cto_bundle=sZI46V8lMkJoJTJCTVdaUTk1QUlzaTJ3R1g5bDQ2JTJCJTJGMUdzTFh3TkxlelNDV0lMem1kQ01OeklIJTJCUHNRekNYNmZOc0Q0S0F6WXY2Mk1uVUpxUWkyd0JvTzNMZ3JyJTJGQkFiMkcxNlhFJTJGMTB4TTNnQiUyQmp6cndpaEpQcExLRXJDbnJWNUI1MG9mZ1I1b0ZFUFBFYW13WmxYTGpQJTJGd0dPQlElM0QlM0Q; _rdt_uuid=1768273138309.bce4243b-b00a-4f73-873c-f40a6a761270; _uetsid=8b088e5015dd11f180a63f06460dee96|85igp3|2|g44|0|2252; _scid_r=om68HZP1ddMoJaFXVjCWvJPzeJBVfZ5IESilnA; ttcsid=1772781490691::HocCBz4JeJFTVsdny2fM.144.1772781502592.0; ttcsid_CL46DJ3C77U0CK80E320=1772781490690::Fhf05tVsI05fylC6rn72.144.1772781502592.1; _uetvid=ceaaf8b0f02b11f0b8e1751351e65873|vlt4kl|1772781978981|5|1|bat.bing.com/p/insights/c/j; _ga_5Q57T3BBYZ=GS2.1.s1772781490$o157$g1$t1772782491$j60$l0$h1535647158; __cf_bm=rRWcHNKay1DLLY0jlmLwMKUHo77ptmjmKVIrbYPYkU0-1772848729-1.0.1.1-a1qBLzJ6NmPKqiWqlyuBuKPWZ.U133LPawssNBAcfVA4KSrj1xLuE6K_Eipw2bwCCJd6bre2nkw.HGZGrL.HhUohAA.APfS.chU7ofhNlOc; __stripe_sid=45621a1f-e604-4e97-9cb3-77dd6b6a6f497c40c8; cf_clearance=fMArZwoyE26_jH9RW4hnbXALpRURAZDTI_M5LT6.kl4-1772849257-1.2.1.1-CgXmDjfhqlbsjZ9UFWyU.XpFBMli35T10eTJRnAAUZwZp3GKcSgS.q6esQ05CAE9pnVl7DMWVf_Da.daB.bL0jmtixR3rYRgik_FT..W8OaLU9JYotfStpxqvVEAnISzX2LQeATQmUqi_9lE4WsAoFCLgTc0EClHgXBuchFeayJ614s96euSg5LrZJIgnmgcxPKGXJ1Dq10b4Pb7eLYlfr3mm63zcKL9R_ZlNbWoIjU'
+    }
+    payload = {
+        "category": "pod",
+        "customPrompt": "",
+        "region": "US"
+    }
+    
+    keywords = []
+    try:
+        # Sử dụng requests để lấy data (chạy đồng bộ trong hàm async tạm thời)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        
+        if response.status_code == 200:
             try:
-                await page.wait_for_selector('.search-hot-keyword', timeout=15000)
-            except Exception as e:
-                print(f"[AUTO CRAWL WARN] Không đợi được selector .search-hot-keyword: {e}")
+                result = response.json()
                 
-            await page.wait_for_timeout(1000)
-            
-            # In HTML ra để người dùng tự debug
-            with open("homepage_debug.html", "w", encoding="utf-8") as f:
-                f.write(await page.content())
-            print("[AUTO CRAWL] ⚙ Đã ghi HTML trang chủ ra file 'homepage_debug.html' để debug.")
-            
-            # Lấy tất cả text của từ khóa
-            keywords_json = await page.evaluate('''() => {
-                const elems = document.querySelectorAll('.search-hot-keyword');
-                const words = new Set();
-                elems.forEach(el => {
-                    let text = el.textContent.trim();
-                    if (text && text.length > 2) {
-                        words.add(text);
-                    }
-                });
-                return JSON.stringify(Array.from(words));
-            }''')
-            
-            keywords = json.loads(keywords_json)
-        except Exception as e:
-            print(f"[AUTO CRAWL ERR] Lỗi khi quét từ khoá trang chủ: {e}")
-            keywords = []
-        finally:
-            await browser.close()
+                # Ưu tiên lấy theo đúng cấu trúc JSON trả về (data.trending_keywords / data.etsy_suggestions)
+                if result.get("success") and isinstance(result.get("data"), dict):
+                    data = result["data"]
+                    if "trending_keywords" in data and isinstance(data["trending_keywords"], list):
+                        for item in data["trending_keywords"]:
+                            if isinstance(item, dict) and "keyword" in item:
+                                keywords.append(item["keyword"])
+                                
+                    if "etsy_suggestions" in data and isinstance(data["etsy_suggestions"], list):
+                        for item in data["etsy_suggestions"]:
+                            if isinstance(item, dict) and "keyword" in item:
+                                keywords.append(item["keyword"])
+                
+                # Fallback: Trích xuất đệ quy nếu format API thay đổi
+                if not keywords:
+                    def extract_keywords_recursive(obj):
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k == 'keyword' and isinstance(v, str):
+                                    keywords.append(v)
+                                else:
+                                    extract_keywords_recursive(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                extract_keywords_recursive(item)
+                    extract_keywords_recursive(result)
+
+            except Exception as e:
+                print(f"[AUTO CRAWL ERR] Lỗi parse JSON: {e}")
+        else:
+            print(f"[AUTO CRAWL ERR] Status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[AUTO CRAWL ERR] Lỗi gọi API: {e}")
+        
+    # Loại bỏ các từ trống
+    keywords = [kw for kw in keywords if str(kw).strip()]
+    
+    if not keywords:
+        print("[AUTO CRAWL WARN] Không tìm thấy từ khóa nào, dùng từ khóa phòng hờ.")
+        keywords = ["custom photo gifts", "personalized mug", "funny cat t-shirt"]
+    else:
+        print(f"[AUTO CRAWL] Thu thập được {len(keywords)} từ khoá.")
     
     # Ráp thành URL tìm kiếm
     import urllib.parse
@@ -210,7 +240,7 @@ async def auto_discover_callie_categories() -> list[str]:
     base_search_url = SEARCH_URL_MAP.get("callie", "https://callie.com/category/index?search={}")
     
     for kw in keywords:
-        encoded_kw = urllib.parse.quote(kw)
+        encoded_kw = urllib.parse.quote(str(kw))
         search_link = base_search_url.format(encoded_kw)
         valid_categories.append(search_link)
                 
@@ -331,7 +361,8 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        # Sử dụng context để dễ dàng quản lý state hơn nếu cần
+        context = await browser.new_context()
 
         for page_num in range(1, pages_to_crawl + 1):
             current_url = listing_url
@@ -342,52 +373,83 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                 current_url = f"{base_url_clean}{sep}p={page_num}"
                 print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
 
+            # Tạo trang độc lập cho mỗi vòng lặp để tránh lỗi Navigation interrupted
+            page = await context.new_page()
+
             try:
                 await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(2000)
+                
+                # Ghi HTML trang hiện tại ở vòng lặp đầu tiên ra file để dễ test và debug DOM
+                if page_num == 1:
+                    try:
+                        html_content = await page.content()
+                        import urllib.parse
+                        domain = urllib.parse.urlparse(listing_url).netloc.replace("www.", "").split(".")[0]
+                        debug_file = f"debug_dom_{domain}.html"
+                        with open(debug_file, "w", encoding="utf-8") as f:
+                            f.write(html_content)
+                        print(f"👉 [DEBUG] Đã lưu DOM trang tìm kiếm ra {debug_file}")
+                    except Exception as e:
+                        print(f"Lỗi ghi file debug HTML: {e}")
+
             except Exception as e:
                 print(f"[CRAWL ERR] Lỗi load URL {current_url}: {e}")
+                await page.close()
                 continue
 
             # Scroll + click more nhiều lần
             max_tries = 60 if not is_allegro else 15
             last_count = 0
             for _ in range(max_tries):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                except Exception:
+                    pass
                 await page.wait_for_timeout(1000)
 
-                more_selectors = [
-                    '.more.btn', '.btn-more', '.load-more', '.loadmore',
-                    '[data-action="more"]', 'button.more', 'a.more',
-                    '.see-more', '.btn-loadmore', '.pagination__next',
-                    '.next-page', '[class*="load-more"]', '[class*="show-more"]',
-                    '[class*="loadMore"]', '[class*="see-more"]',
-                ]
                 clicked = False
-                for sel in more_selectors:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.is_visible(timeout=500):
-                            await btn.click()
-                            await page.wait_for_timeout(2000)
-                            clicked = True
-                            break
-                    except Exception:
-                        pass
+                
+                # CHỈ click "Load more" nếu KHÔNG phải web phân trang thủ công qua URL (như allegro)
+                # Vì click next page bằng selector có thể gây conflict với logic page_num++ ở trên
+                if not is_allegro:
+                    more_selectors = [
+                        '.more.btn', '.btn-more', '.load-more', '.loadmore',
+                        '[data-action="more"]', 'button.more', 'a.more',
+                        '.see-more', '.btn-loadmore', '.pagination__next',
+                        '.next-page', '[class*="load-more"]', '[class*="show-more"]',
+                        '[class*="loadMore"]', '[class*="see-more"]',
+                    ]
+                    for sel in more_selectors:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=500):
+                                await btn.click()
+                                await page.wait_for_timeout(2000)
+                                clicked = True
+                                break
+                        except Exception:
+                            pass
 
                 # Nếu không click được và số link không tăng → dừng scroll trang hiện tại
-                cur_count = await page.evaluate("document.querySelectorAll('a[href]').length")
-                if cur_count == last_count and not clicked:
+                try:
+                    cur_count = await page.evaluate("document.querySelectorAll('a[href]').length")
+                    if cur_count == last_count and not clicked:
+                        break
+                    last_count = cur_count
+                except Exception:
                     break
-                last_count = cur_count
 
             # Lấy tất cả link trang này
-            links_json = await page.evaluate(SCROLL_AND_LOAD_JS)
             try:
+                links_json = await page.evaluate(SCROLL_AND_LOAD_JS)
                 parsed = json.loads(links_json)
                 all_extracted_links.update(parsed)
             except Exception:
                 pass
+                
+            # Đóng page hiện tại
+            await page.close()
 
         await browser.close()
 
