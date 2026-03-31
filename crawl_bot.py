@@ -313,6 +313,7 @@ SCROLL_AND_LOAD_JS = """
                 'a[class*="more"]', '.pagination__next', '.next-page',
                 'button.more', 'a.more', '.see-more', '[class*="see-more"]',
                 '.btn-loadmore', '[class*="loadMore"]',
+                '.t4s-pagination__item.pagination__item--next', '.pagination__item--next',
             ];
 
             let clicked = false;
@@ -434,6 +435,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                         '.see-more', '.btn-loadmore', '.pagination__next',
                         '.next-page', '[class*="load-more"]', '[class*="show-more"]',
                         '[class*="loadMore"]', '[class*="see-more"]',
+                        '.t4s-pagination__item.pagination__item--next', '.pagination__item--next',
                     ]
                     for sel in more_selectors:
                         try:
