@@ -371,8 +371,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         # Sử dụng stealth để ẩn dấu vết Playwright bot khỏi Cloudflare
-        from playwright_stealth import Stealth
-        stealth = Stealth()
+        from playwright_stealth import stealth_async
         # Sử dụng context để dễ dàng quản lý state hơn nếu cần
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -390,7 +389,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
 
             # Tạo trang độc lập cho mỗi vòng lặp để tránh lỗi Navigation interrupted
             page = await context.new_page()
-            await stealth.apply_stealth_async(page)
+            await stealth_async(page)
 
             try:
                 await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
