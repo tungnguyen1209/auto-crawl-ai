@@ -367,7 +367,14 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     import re
     all_extracted_links = set()
     is_allegro = "allegro.pl" in listing_url or "allegro" in listing_url
-    pages_to_crawl = 5 if is_allegro else 1
+    is_flagwix = "flagwix" in listing_url.lower()
+    
+    if is_flagwix:
+        pages_to_crawl = 200
+    elif is_allegro:
+        pages_to_crawl = 5
+    else:
+        pages_to_crawl = 1
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -386,6 +393,11 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                 base_url_clean = re.sub(r'([?&])p=\d+', '', listing_url)
                 sep = "&" if "?" in base_url_clean else "?"
                 current_url = f"{base_url_clean}{sep}p={page_num}"
+                print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
+            elif is_flagwix:
+                base_url_clean = re.sub(r'([?&])page=\d+', '', listing_url)
+                sep = "&" if "?" in base_url_clean else "?"
+                current_url = f"{base_url_clean}{sep}page={page_num}"
                 print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
 
             # Tạo trang độc lập cho mỗi vòng lặp để tránh lỗi Navigation interrupted
@@ -415,7 +427,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                 continue
 
             # Scroll + click more nhiều lần
-            max_tries = 60 if not is_allegro else 15
+            max_tries = 60 if not (is_allegro or is_flagwix) else 15
             last_count = 0
             for _ in range(max_tries):
                 try:
@@ -428,7 +440,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                 
                 # CHỈ click "Load more" nếu KHÔNG phải web phân trang thủ công qua URL (như allegro)
                 # Vì click next page bằng selector có thể gây conflict với logic page_num++ ở trên
-                if not is_allegro:
+                if not is_allegro and not is_flagwix:
                     more_selectors = [
                         '.more.btn', '.btn-more', '.load-more', '.loadmore',
                         '[data-action="more"]', 'button.more', 'a.more',
@@ -461,6 +473,14 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
             try:
                 links_json = await page.evaluate(SCROLL_AND_LOAD_JS)
                 parsed = json.loads(links_json)
+                
+                if is_flagwix:
+                    new_links = [l for l in parsed if "/products/" in l.lower() and l not in all_extracted_links]
+                    if not new_links:
+                        print(f"[CRAWL] Hết sản phẩm ở trang {page_num}. Dừng phân trang.")
+                        await page.close()
+                        break
+
                 all_extracted_links.update(parsed)
             except Exception:
                 pass
