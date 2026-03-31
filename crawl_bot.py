@@ -58,16 +58,16 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "") # Nhập Chat ID của bạn
 # (Đã xoá AUTO_CRAWL_LIST do tích hợp AI tự động quét website)
 
 CRAWLED_FILE       = "crawled_urls.txt"
-PRINTERVAL_API     = "https://printerval.com/crawl-product/create-from-html?debug=1"
+PRINTERVAL_API     = "https://250spirit.com/crawl-product/create-from-html?debug=1"
 USER_EMAIL         = "duytungnguyen.bkhn.95@gmail.com"
-USER_TOKEN         = "4a5747260b5614a86d6fb70f1012ad19"
-BRAND_ID           = 9
+USER_TOKEN         = "9aac5f6f07510353822a44227b7f0231"
+BRAND_ID           = 1
 DEFAULT_CATEGORIES = -1   # -1 để bật AI tự động dự đoán danh mục cho mọi sản phẩm
 COUNTRY_CODE       = "us"
 GENERATE_VARIANT   = 1
 IS_OVERWRITE       = 1
 REMOVE_SIZE_CHART  = True
-TAGS               = "14"
+TAGS               = "29458"
 CONCURRENCY        = 3   # Số luồng import song song
 
 HEADERS_HTML = {
@@ -90,6 +90,7 @@ SEARCH_URL_MAP = {
     "amazon": "https://www.amazon.com/s?k={}",
     "etsy": "https://www.etsy.com/search?q={}",
     "redbubble": "https://www.redbubble.com/shop?query={}",
+    "flagwix": "https://flagwix.com/search?q={}",
 }
 
 # ─── Job tracking ─────────────────────────────────────────────
@@ -369,8 +370,14 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+        # Sử dụng stealth để ẩn dấu vết Playwright bot khỏi Cloudflare
+        from playwright_stealth import Stealth
+        stealth = Stealth()
         # Sử dụng context để dễ dàng quản lý state hơn nếu cần
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={'width': 1920, 'height': 1080}
+        )
 
         for page_num in range(1, pages_to_crawl + 1):
             current_url = listing_url
@@ -383,6 +390,7 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
 
             # Tạo trang độc lập cho mỗi vòng lặp để tránh lỗi Navigation interrupted
             page = await context.new_page()
+            await stealth.apply_stealth_async(page)
 
             try:
                 await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
@@ -505,6 +513,11 @@ def filter_product_links(links: list[str], listing_url: str, website: str = "cal
         link_lower = link.lower()
         
         # --- Rule đặc thù cho các trang cố định ---
+        if "flagwix" in website.lower() or "flagwix.com" in base:
+            if "/products/" in link_lower:
+                product_links.append(link)
+            continue
+            
         if "callie" in website.lower() or "callie.com" in base:
             if link_path.startswith('/personalized'):
                 product_links.append(link)
@@ -542,7 +555,7 @@ def filter_product_links(links: list[str], listing_url: str, website: str = "cal
     # 3. Lọc trùng URL và xoá query parameters không cần thiết
     unique_links = list(dict.fromkeys(product_links))
     
-    is_known_site = any(x in website.lower() for x in ["callie", "allegro", "amazon", "etsy", "redbubble"])
+    is_known_site = any(x in website.lower() for x in ["callie", "allegro", "amazon", "etsy", "redbubble", "flagwix"])
     
     # 4. Phân tích cụm cấu trúc phổ biến nhất (Smart Grouping Heuristic)
     # Tại trang tìm kiếm, các link sản phẩm xuất hiện phần lớn và cùng cấu trúc path.
