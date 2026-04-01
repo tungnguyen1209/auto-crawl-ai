@@ -359,7 +359,7 @@ SCROLL_AND_LOAD_JS = """
 """
 
 
-async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
+async def collect_product_urls_crawl4ai(listing_url: str, status_msg=None, context_text="", on_batch_callback=None) -> list[str]:
     """
     Dùng Playwright để scroll, click 'more' và gom toàn bộ link.
     Đối với trang hỗ trợ phân trang (như allegro), vòng lặp sẽ chạy qua nhiều trang.
@@ -378,8 +378,15 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        # Sử dụng stealth để ẩn dấu vết Playwright bot khỏi Cloudflare
-        from playwright_stealth import stealth_async
+        # Sử dụng stealth để ẩn dấu vết Playwright bot khỏi Cloudflare (hỗ trợ cả 2 phiên bản thư viện)
+        try:
+            from playwright_stealth import Stealth
+            stealth_instance = Stealth()
+            is_stealth_class = True
+        except ImportError:
+            from playwright_stealth import stealth_async
+            is_stealth_class = False
+            
         # Sử dụng context để dễ dàng quản lý state hơn nếu cần
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -393,16 +400,31 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                 base_url_clean = re.sub(r'([?&])p=\d+', '', listing_url)
                 sep = "&" if "?" in base_url_clean else "?"
                 current_url = f"{base_url_clean}{sep}p={page_num}"
-                print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
             elif is_flagwix:
                 base_url_clean = re.sub(r'([?&])page=\d+', '', listing_url)
                 sep = "&" if "?" in base_url_clean else "?"
                 current_url = f"{base_url_clean}{sep}page={page_num}"
-                print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
+                
+            print(f"[CRAWL] Đang tải trang {page_num}: {current_url}")
+            
+            if status_msg and pages_to_crawl > 1:
+                try:
+                    await status_msg.edit_text(
+                        f"{context_text}⏳ *Bước 1/3:* Đang tải và cào trang {page_num}/{pages_to_crawl}...\n"
+                        f"_(Link: {current_url})_",
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                except Exception:
+                    pass
 
             # Tạo trang độc lập cho mỗi vòng lặp để tránh lỗi Navigation interrupted
             page = await context.new_page()
-            await stealth_async(page)
+            
+            if is_stealth_class:
+                await stealth_instance.apply_stealth_async(page)
+            else:
+                await stealth_async(page)
 
             try:
                 await page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
@@ -482,6 +504,12 @@ async def collect_product_urls_crawl4ai(listing_url: str) -> list[str]:
                         break
 
                 all_extracted_links.update(parsed)
+                
+                if on_batch_callback and page_num % 10 == 0:
+                    try:
+                        await on_batch_callback(list(all_extracted_links))
+                    except Exception as e:
+                        print(f"[CRAWL ERR] Lỗi gọi callback: {e}")
             except Exception:
                 pass
                 
@@ -707,20 +735,34 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["failed"] += 1
 
 
-def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, market: str = "us", is_auto: bool = False):
-    """Chạy import trong background thread với ThreadPoolExecutor"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
-    total = len(product_urls)
-    counters = {"done": 0, "failed": 0, "skipped": 0}
-    done_links = []
-    lock = threading.Lock()
-
+def run_import_job(product_urls: list[str] | None, chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, market: str = "us", is_auto: bool = False):
+    """Chạy import trong background. Hỗ trợ queue cho luồng real-time stream"""
     job = active_jobs.get(chat_id, {})
-    job["total"] = total
-    job["counters"] = counters
-    job["cancelled"] = False
-    active_jobs[chat_id] = job
+    if product_urls is not None:
+        q = queue.Queue()
+        for u in product_urls:
+            q.put(u)
+        job["total"] = len(product_urls)
+        job["counters"] = {"done": 0, "failed": 0, "skipped": 0}
+        job["cancelled"] = False
+        job["url_queue"] = q
+        job["crawl_finished"] = True
+        job["done_links"] = []
+        job["lock"] = threading.Lock()
+        job["start_time"] = time.time()
+        job["url"] = "Auto Crawl" if is_auto else ""
+        active_jobs[chat_id] = job
+    
+    job = active_jobs.get(chat_id, {})
+    if not job:
+        return
+        
+    q = job.get("url_queue")
+    counters = job.get("counters", {"done": 0, "failed": 0, "skipped": 0})
+    done_links = job.get("done_links", [])
+    lock = job.get("lock", threading.Lock())
 
     def send(msg):
         if is_auto and not ADMIN_CHAT_ID:
@@ -741,28 +783,50 @@ def run_import_job(product_urls: list[str], chat_id: int, loop, bot, categories:
 
     last_report = [0]
 
-    def worker(url: str):
-        if active_jobs.get(chat_id, {}).get("cancelled"):
-            return
-        process_one(url, counters, lock, done_links, categories=categories, market=market)
-        done_now = counters["done"] + counters["failed"] + counters["skipped"]
-        # Báo cáo mỗi 10 SP hoặc lúc hoàn thành
-        if done_now - last_report[0] >= 10 or done_now == total:
-            last_report[0] = done_now
-            elapsed = time.time() - job["start_time"]
-            speed = done_now / elapsed * 60 if elapsed > 0 else 0
-            pct = done_now / total * 100
-            send(
-                f"⏳ [{done_now}/{total}] {pct:.0f}%\n"
-                f"✅ Thành công: {counters['done']} | ❌ Thất bại: {counters['failed']} | ⏭️ Bỏ qua: {counters['skipped']}\n"
-                f"🚀 ~{speed:.0f} SP/phút"
-            )
-
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
-        futures = [ex.submit(worker, url) for url in product_urls]
-        for f in as_completed(futures):
-            if active_jobs.get(chat_id, {}).get("cancelled"):
+    def worker():
+        while True:
+            current_job = active_jobs.get(chat_id, {})
+            if current_job.get("cancelled"):
                 break
+            try:
+                url = q.get(timeout=2)
+            except queue.Empty:
+                if current_job.get("crawl_finished"):
+                    break
+                continue
+                
+            process_one(url, counters, lock, done_links, categories=categories, market=market)
+            
+            with lock:
+                done_now = counters["done"] + counters["failed"] + counters["skipped"]
+                total = current_job.get("total", done_now)
+                is_finished = current_job.get("crawl_finished", False)
+                
+                # Báo cáo mỗi 10 SP hoặc lúc hoàn thành
+                if done_now - last_report[0] >= 10 or (done_now == total and is_finished and done_now > last_report[0]):
+                    last_report[0] = done_now
+                    elapsed = time.time() - job["start_time"]
+                    speed = done_now / elapsed * 60 if elapsed > 0 else 0
+                    pct = (done_now / total * 100) if total > 0 else 0
+                    msg = (
+                        f"⏳ [{done_now}/{total}] {pct:.0f}%\n"
+                        f"✅ Thành công: {counters['done']} | ❌ Thất bại: {counters['failed']} | ⏭️ Bỏ qua: {counters['skipped']}\n"
+                        f"🚀 ~{speed:.0f} SP/phút"
+                    )
+                    send(msg)
+            try:
+                q.task_done()
+            except ValueError:
+                pass
+
+    threads = []
+    for _ in range(CONCURRENCY):
+        t = threading.Thread(target=worker)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
 
     elapsed = time.time() - job["start_time"]
     cancelled = job.get("cancelled", False)
@@ -934,77 +998,43 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
         await update.message.reply_text("❌ URL không hợp lệ!")
         return
 
-    await update.message.reply_text(
+    context_text = (
         f"🌐 URL: `{url}`\n"
         f"🗂️ Category ID: `{categories}`\n"
         f"🌍 Website logic: `{website}`\n"
         f"🇺🇸 Market: `{market}`\n\n"
-        f"⏳ *Bước 1/3:* Đang mở browser & scroll trang...\n"
+    )
+    status_msg = await update.message.reply_text(
+        f"{context_text}⏳ *Bước 1/3:* Đang mở browser & scroll trang...\n"
         f"_(Có thể mất 1-2 phút nếu trang có nhiều sản phẩm)_",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        disable_web_page_preview=True
     )
 
-    # Bước 1: Thu thập link (async / browser)
-    try:
-        all_links = await collect_product_urls_crawl4ai(url)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi khi crawl trang:\n`{str(e)[:200]}`", parse_mode="Markdown")
-        return
+    import queue
+    import threading
 
-    if not all_links:
-        await update.message.reply_text("❌ Không tìm thấy link nào trên trang này!")
-        return
-
-    # Bước 2: Lọc link sản phẩm
-    product_urls = filter_product_links(all_links, url, website)
-
-    if not product_urls:
-        # Nếu không lọc được, dùng toàn bộ link
-        product_urls = all_links
-        
-    # Giới hạn số lượng link sản phẩm tối đa (Chống tràn RAM/API Rate Limit)
-    MAX_LINKS_PER_CRAWL = 2000 # <-- Bạn có thể chỉnh lại số này
-    if len(product_urls) > MAX_LINKS_PER_CRAWL:
-        product_urls = product_urls[:MAX_LINKS_PER_CRAWL]
-        
-    # Ghi file danh sách urls ngay lập tức
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    domain = p.netloc.replace("www.", "").split(".")[0] if p.netloc else "domain"
-    path_part = p.path.strip("/").replace("/", "-") if p.path else "home"
-    list_file_name = f"list-urls-{domain}-{path_part}.txt"
-    try:
-        with open(list_file_name, "w", encoding="utf-8") as f:
-            f.write("\n".join(product_urls))
-        print(f"Đã lưu danh sách URL vào: {list_file_name}")
-    except Exception as e:
-        print(f"Lỗi khi lưu list urls: {e}")
-
-    await update.message.reply_text(
-        f"✅ *Bước 1/3 xong!*\n"
-        f"📊 Tổng link tìm thấy: {len(all_links)}\n"
-        f"🎯 Lấy {len(product_urls)} sản phẩm để Import (đã giới hạn {MAX_LINKS_PER_CRAWL})\n"
-        f"💾 Đã lưu danh sách vào file: `{list_file_name}`\n\n"
-        f"🚀 *Bước 2/3:* Bắt đầu import lên Printerval...\n"
-        f"_(Báo cáo mỗi 10 sản phẩm)_",
-        parse_mode="Markdown"
-    )
-
-    # Bước 3: Import (background thread)
+    job_queue = queue.Queue()
     loop = asyncio.get_event_loop()
+    
     active_jobs[chat_id] = {
         "url": url,
         "categories": categories,
-        "total": len(product_urls),
+        "total": 0,
         "start_time": time.time(),
         "cancelled": False,
         "counters": {"done": 0, "failed": 0, "skipped": 0},
+        "url_queue": job_queue,
+        "crawl_finished": False,
+        "done_links": [],
+        "lock": threading.Lock()
     }
 
+    # Start the importer thread IMMEDIATELY for streaming
     thread = threading.Thread(
         target=run_import_job,
         kwargs={
-            "product_urls": product_urls,
+            "product_urls": None,
             "chat_id": chat_id,
             "loop": loop,
             "bot": context.bot,
@@ -1015,6 +1045,47 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
         daemon=True
     )
     thread.start()
+
+    submitted_links = set()
+
+    async def batch_callback(current_links):
+        nonlocal submitted_links, url, website
+        new_product_urls = filter_product_links([l for l in current_links if l not in submitted_links], url, website)
+        
+        # Limit links per crawl
+        MAX_LINKS_PER_CRAWL = 2000
+        total_queued = active_jobs[chat_id]["total"]
+        if total_queued >= MAX_LINKS_PER_CRAWL:
+            return
+            
+        # Ensure we don't queue past max
+        if total_queued + len(new_product_urls) > MAX_LINKS_PER_CRAWL:
+            new_product_urls = new_product_urls[:MAX_LINKS_PER_CRAWL - total_queued]
+            
+        if not new_product_urls:
+            return
+            
+        submitted_links.update(new_product_urls)
+        job = active_jobs.get(chat_id)
+        if job and not job.get("cancelled"):
+            with job["lock"]:
+                job["total"] += len(new_product_urls)
+            for u in new_product_urls:
+                job["url_queue"].put(u)
+
+    # Bước 1: Thu thập link (async / browser)
+    try:
+        all_links = await collect_product_urls_crawl4ai(url, status_msg, context_text, on_batch_callback=batch_callback)
+        await batch_callback(list(all_links))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi khi crawl trang:\n`{str(e)[:200]}`", parse_mode="Markdown")
+        if chat_id in active_jobs:
+            active_jobs[chat_id]["crawl_finished"] = True
+        return
+
+    # Let the thread know we're done getting links
+    if chat_id in active_jobs:
+        active_jobs[chat_id]["crawl_finished"] = True
 
 
 def parse_command_args(text: str):
