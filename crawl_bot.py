@@ -1149,16 +1149,28 @@ def build_crawling_url(keyword_or_url: str, website: str) -> (str, str):
 # ─── Conversation states cho /crawl wizard ────────────────────────────────────
 CRAWL_ASK_URL, CRAWL_ASK_WEBSITE, CRAWL_ASK_MARKET, CRAWL_ASK_CATEGORY, CRAWL_ASK_MAX_PAGE = range(5)
 
+async def _reply(update: Update, text: str, retries: int = 3):
+    """reply_text với retry khi bị TimedOut."""
+    from telegram.error import TimedOut
+    for attempt in range(retries):
+        try:
+            await update.message.reply_text(text, parse_mode="Markdown")
+            return
+        except TimedOut:
+            if attempt < retries - 1:
+                await asyncio.sleep(2)
+            else:
+                raise
+
 async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/crawl → bắt đầu wizard hỏi từng bước"""
     if not update.message:
         return
     context.user_data.clear()
-    await update.message.reply_text(
+    await _reply(update,
         "🔗 *Bước 1/5 — URL hoặc từ khoá:*\n"
         "Nhập link danh sách sản phẩm hoặc từ khoá muốn tìm kiếm.\n"
-        "_(Gõ /cancel để huỷ)_",
-        parse_mode="Markdown"
+        "_(Gõ /cancel để huỷ)_"
     )
     return CRAWL_ASK_URL
 
@@ -1167,12 +1179,11 @@ async def crawl_got_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return CRAWL_ASK_URL
     context.user_data["crawl_input"] = update.message.text.strip()
-    await update.message.reply_text(
+    await _reply(update,
         "🌐 *Bước 2/5 — Website:*\n"
         "Nhập tên website cần crawl.\n"
         "Ví dụ: `flagwix.com`, `callie.com`, `allegro.pl`\n"
-        "_(Enter để dùng mặc định: `callie.com`)_",
-        parse_mode="Markdown"
+        "_(Enter để dùng mặc định: `callie.com`)_"
     )
     return CRAWL_ASK_WEBSITE
 
@@ -1182,12 +1193,11 @@ async def crawl_got_website(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CRAWL_ASK_WEBSITE
     text = update.message.text.strip()
     context.user_data["crawl_website"] = text if text else "callie.com"
-    await update.message.reply_text(
+    await _reply(update,
         "🏳️ *Bước 3/5 — Market:*\n"
         "Nhập mã thị trường (2 ký tự).\n"
         "Ví dụ: `us`, `uk`, `pl`\n"
-        "_(Enter để dùng mặc định: `us`)_",
-        parse_mode="Markdown"
+        "_(Enter để dùng mặc định: `us`)_"
     )
     return CRAWL_ASK_MARKET
 
@@ -1197,11 +1207,10 @@ async def crawl_got_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CRAWL_ASK_MARKET
     text = update.message.text.strip().lower()
     context.user_data["crawl_market"] = text if text else "us"
-    await update.message.reply_text(
+    await _reply(update,
         "🗂️ *Bước 4/5 — Category ID:*\n"
         "Nhập ID danh mục sản phẩm.\n"
-        "_(Enter để dùng mặc định: `-1` — AI tự động phân loại)_",
-        parse_mode="Markdown"
+        "_(Enter để dùng mặc định: `-1` — AI tự động phân loại)_"
     )
     return CRAWL_ASK_CATEGORY
 
@@ -1213,7 +1222,7 @@ async def crawl_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         context.user_data["crawl_categories"] = int(text) if text else -1
     except ValueError:
-        await update.message.reply_text("❌ Vui lòng nhập số nguyên. Thử lại:")
+        await _reply(update, "❌ Vui lòng nhập số nguyên. Thử lại:")
         return CRAWL_ASK_CATEGORY
 
     website = context.user_data.get("crawl_website", "callie.com")
@@ -1221,11 +1230,10 @@ async def crawl_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
     is_flagwix = "flagwix" in website.lower() or "flagwix" in crawl_input.lower()
 
     if is_flagwix:
-        await update.message.reply_text(
+        await _reply(update,
             "📄 *Bước 5/5 — Page lớn nhất (flagwix):*\n"
             "Nhập số trang lớn nhất để bắt đầu crawl từ đó xuống trang 1.\n"
-            "_(Enter để dùng mặc định: `200`)_",
-            parse_mode="Markdown"
+            "_(Enter để dùng mặc định: `200`)_"
         )
         return CRAWL_ASK_MAX_PAGE
     else:
@@ -1240,7 +1248,7 @@ async def crawl_got_max_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         context.user_data["crawl_max_page"] = int(text) if text else 200
     except ValueError:
-        await update.message.reply_text("❌ Vui lòng nhập số nguyên. Thử lại:")
+        await _reply(update, "❌ Vui lòng nhập số nguyên. Thử lại:")
         return CRAWL_ASK_MAX_PAGE
     return await crawl_start(update, context)
 
