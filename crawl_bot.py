@@ -25,7 +25,7 @@ import random
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import litellm
 
 litellm.drop_params = True
@@ -359,7 +359,7 @@ SCROLL_AND_LOAD_JS = """
 """
 
 
-async def collect_product_urls_crawl4ai(listing_url: str, status_msg=None, context_text="", on_batch_callback=None) -> list[str]:
+async def collect_product_urls_crawl4ai(listing_url: str, status_msg=None, context_text="", on_batch_callback=None, max_page: int = 200) -> list[str]:
     """
     Dùng Playwright để scroll, click 'more' và gom toàn bộ link.
     Đối với trang hỗ trợ phân trang (như allegro), vòng lặp sẽ chạy qua nhiều trang.
@@ -368,9 +368,9 @@ async def collect_product_urls_crawl4ai(listing_url: str, status_msg=None, conte
     all_extracted_links = set()
     is_allegro = "allegro.pl" in listing_url or "allegro" in listing_url
     is_flagwix = "flagwix" in listing_url.lower()
-    
+
     if is_flagwix:
-        pages_to_crawl = 200
+        pages_to_crawl = max_page
     elif is_allegro:
         pages_to_crawl = 5
     else:
@@ -393,7 +393,8 @@ async def collect_product_urls_crawl4ai(listing_url: str, status_msg=None, conte
             viewport={'width': 1920, 'height': 1080}
         )
 
-        for page_num in range(1, pages_to_crawl + 1):
+        page_range = range(pages_to_crawl, 0, -1) if is_flagwix else range(1, pages_to_crawl + 1)
+        for page_num in page_range:
             current_url = listing_url
             if is_allegro:
                 # Xoá param p= cũ nếu có để tránh trùng lặp
@@ -983,7 +984,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Không có job nào đang chạy.")
 
 
-async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES, website: str = "callie.com", market: str = "us"):
+async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES, website: str = "callie.com", market: str = "us", max_page: int = 200):
     """Logic chính: nhận URL → crawl → import"""
     chat_id = update.effective_chat.id
 
@@ -1075,7 +1076,7 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
 
     # Bước 1: Thu thập link (async / browser)
     try:
-        all_links = await collect_product_urls_crawl4ai(url, status_msg, context_text, on_batch_callback=batch_callback)
+        all_links = await collect_product_urls_crawl4ai(url, status_msg, context_text, on_batch_callback=batch_callback, max_page=max_page)
         await batch_callback(list(all_links))
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi khi crawl trang:\n`{str(e)[:200]}`", parse_mode="Markdown")
@@ -1093,16 +1094,23 @@ def parse_command_args(text: str):
     market = "us"
     website = "callie.com"
     categories = -1
-    
+    max_page = 200
+
     found_market = False
     found_website = False
     found_category = False
+    found_max_page = False
 
     while len(parts) > 0:
         last = parts[-1].lower()
         if not found_market and len(last) == 2 and last.isalpha():
             market = last
             found_market = True
+            parts.pop()
+        elif not found_max_page and last.isdigit() and int(last) > 10:
+            # Số lớn hơn 10 ở cuối → max_page (page lớn nhất của flagwix)
+            max_page = int(last)
+            found_max_page = True
             parts.pop()
         elif not found_category and (last.isdigit() or (last.startswith('-') and last[1:].isdigit())):
             categories = int(last)
@@ -1116,7 +1124,7 @@ def parse_command_args(text: str):
             break
 
     keyword_or_url = " ".join(parts).strip()
-    return keyword_or_url, categories, website, market
+    return keyword_or_url, categories, website, market, max_page
 
 
 def build_crawling_url(keyword_or_url: str, website: str) -> (str, str):
@@ -1138,24 +1146,123 @@ def build_crawling_url(keyword_or_url: str, website: str) -> (str, str):
         
     return url, website
 
+# ─── Conversation states cho /crawl wizard ────────────────────────────────────
+CRAWL_ASK_URL, CRAWL_ASK_WEBSITE, CRAWL_ASK_MARKET, CRAWL_ASK_CATEGORY, CRAWL_ASK_MAX_PAGE = range(5)
+
 async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/crawl {keyword_or_url} [category_id] [website] [market]"""
-    if not update.message or not update.message.text:
+    """/crawl → bắt đầu wizard hỏi từng bước"""
+    if not update.message:
         return
-    text = update.message.text.replace("/crawl", "", 1).strip()
-    if not text:
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🔗 *Bước 1/5 — URL hoặc từ khoá:*\n"
+        "Nhập link danh sách sản phẩm hoặc từ khoá muốn tìm kiếm.\n"
+        "_(Gõ /cancel để huỷ)_",
+        parse_mode="Markdown"
+    )
+    return CRAWL_ASK_URL
+
+
+async def crawl_got_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_URL
+    context.user_data["crawl_input"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🌐 *Bước 2/5 — Website:*\n"
+        "Nhập tên website cần crawl.\n"
+        "Ví dụ: `flagwix.com`, `callie.com`, `allegro.pl`\n"
+        "_(Enter để dùng mặc định: `callie.com`)_",
+        parse_mode="Markdown"
+    )
+    return CRAWL_ASK_WEBSITE
+
+
+async def crawl_got_website(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_WEBSITE
+    text = update.message.text.strip()
+    context.user_data["crawl_website"] = text if text else "callie.com"
+    await update.message.reply_text(
+        "🏳️ *Bước 3/5 — Market:*\n"
+        "Nhập mã thị trường (2 ký tự).\n"
+        "Ví dụ: `us`, `uk`, `pl`\n"
+        "_(Enter để dùng mặc định: `us`)_",
+        parse_mode="Markdown"
+    )
+    return CRAWL_ASK_MARKET
+
+
+async def crawl_got_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_MARKET
+    text = update.message.text.strip().lower()
+    context.user_data["crawl_market"] = text if text else "us"
+    await update.message.reply_text(
+        "🗂️ *Bước 4/5 — Category ID:*\n"
+        "Nhập ID danh mục sản phẩm.\n"
+        "_(Enter để dùng mặc định: `-1` — AI tự động phân loại)_",
+        parse_mode="Markdown"
+    )
+    return CRAWL_ASK_CATEGORY
+
+
+async def crawl_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_CATEGORY
+    text = update.message.text.strip()
+    try:
+        context.user_data["crawl_categories"] = int(text) if text else -1
+    except ValueError:
+        await update.message.reply_text("❌ Vui lòng nhập số nguyên. Thử lại:")
+        return CRAWL_ASK_CATEGORY
+
+    website = context.user_data.get("crawl_website", "callie.com")
+    crawl_input = context.user_data.get("crawl_input", "")
+    is_flagwix = "flagwix" in website.lower() or "flagwix" in crawl_input.lower()
+
+    if is_flagwix:
         await update.message.reply_text(
-            "❌ Cú pháp: `/crawl {từ khoá/url} [category_id] [website] [market]`\n"
-            "Ví dụ: `/crawl Easter Bunny 33 callie.com us`\n"
-            "Ví dụ: `/crawl https://allegro.pl/listing uk`",
+            "📄 *Bước 5/5 — Page lớn nhất (flagwix):*\n"
+            "Nhập số trang lớn nhất để bắt đầu crawl từ đó xuống trang 1.\n"
+            "_(Enter để dùng mặc định: `200`)_",
             parse_mode="Markdown"
         )
-        return
+        return CRAWL_ASK_MAX_PAGE
+    else:
+        context.user_data["crawl_max_page"] = 200
+        return await crawl_start(update, context)
 
-    keyword_or_url, categories, website, market = parse_command_args(text)
-    url, website = build_crawling_url(keyword_or_url, website)
 
-    await do_crawl(update, context, url, categories=categories, website=website, market=market)
+async def crawl_got_max_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_MAX_PAGE
+    text = update.message.text.strip()
+    try:
+        context.user_data["crawl_max_page"] = int(text) if text else 200
+    except ValueError:
+        await update.message.reply_text("❌ Vui lòng nhập số nguyên. Thử lại:")
+        return CRAWL_ASK_MAX_PAGE
+    return await crawl_start(update, context)
+
+
+async def crawl_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tổng hợp dữ liệu và bắt đầu crawl."""
+    crawl_input = context.user_data.get("crawl_input", "")
+    website     = context.user_data.get("crawl_website", "callie.com")
+    market      = context.user_data.get("crawl_market", "us")
+    categories  = context.user_data.get("crawl_categories", -1)
+    max_page    = context.user_data.get("crawl_max_page", 200)
+
+    url, website = build_crawling_url(crawl_input, website)
+    await do_crawl(update, context, url, categories=categories, website=website, market=market, max_page=max_page)
+    return ConversationHandler.END
+
+
+async def crawl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("❌ Đã huỷ lệnh /crawl.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1336,11 +1443,25 @@ def main():
     print(f"🔑 Token: {TELEGRAM_BOT_TOKEN[:20]}...")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    crawl_conv = ConversationHandler(
+        entry_points=[CommandHandler("crawl", crawl_command)],
+        states={
+            CRAWL_ASK_URL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_url)],
+            CRAWL_ASK_WEBSITE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_website)],
+            CRAWL_ASK_MARKET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_market)],
+            CRAWL_ASK_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_category)],
+            CRAWL_ASK_MAX_PAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_max_page)],
+        },
+        fallbacks=[CommandHandler("cancel", crawl_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+
     app.add_handler(CommandHandler("start",  start_command))
     app.add_handler(CommandHandler("help",   start_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
-    app.add_handler(CommandHandler("crawl",  crawl_command))
+    app.add_handler(crawl_conv)
     app.add_handler(CommandHandler("start_auto_crawl", start_auto_crawl_command))
     app.add_handler(CommandHandler("stop_auto_crawl", stop_auto_crawl_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
