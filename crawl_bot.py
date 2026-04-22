@@ -117,51 +117,86 @@ def add_crawled_url(url):
 # 1. AI CHỌN CATEGORY & TỰ ĐỘNG KHÁM PHÁ WEBSITE
 # ══════════════════════════════════════════════════════════════
 
-def predict_category_with_ai(product_url: str) -> int:
-    """Gọi LLM (Gemini/OpenAI) để phân tích slug URL và tự động chọn Category ID."""
-    try:
-        # Load cache json một lần
-        if not hasattr(predict_category_with_ai, "_cat_json"):
-            with open("us_categories.json", "r", encoding="utf-8") as f:
-                cats = json.load(f)
-            # Rút gọn token để bot đọc nhanh hơn: id, name
-            predict_category_with_ai._cat_json = json.dumps([{"id": c["id"], "name": c["name"]} for c in cats])
+_MARKET_NAME_MAP = {
+    "us": "united states",
+    "uk": "united kingdom",
+    "pl": "poland",
+    "de": "germany",
+    "fr": "france",
+    "ca": "canada",
+    "au": "australia",
+}
 
-        slug = product_url.split("/")[-1].replace("-", " ")
-        prompt = f"""
-Sản phẩm e-commerce (slug/tên): '{slug}'
-Danh sách id + tên danh mục:
-{predict_category_with_ai._cat_json}
+def _extract_meta(html: str, property_name: str) -> str:
+    """Extract content từ <meta property="..." content="..."> hoặc <meta name="..." content="...">"""
+    pattern = rf'<meta[^>]+(?:property|name)=["\'](?:og:)?{re.escape(property_name)}["\'][^>]+content=["\']([^"\']+)["\']'
+    m = re.search(pattern, html, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    # thử chiều ngược lại (content trước, property sau)
+    pattern2 = rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:)?{re.escape(property_name)}["\']'
+    m2 = re.search(pattern2, html, re.IGNORECASE)
+    return m2.group(1).strip() if m2 else ""
 
-Trả về CHỈ một con số nguyên (integer) là `id` của danh mục phù hợp nhất với sản phẩm này. KHÔNG kèm bất kỳ thông báo hay text nào khác. Nếu không có gì thực sự khớp, trả về 35.
-"""
-        model_name = os.environ.get("AI_MODEL_NAME", "gemini/gemini-2.5-flash-lite") # Mặc định dùng Gemini
-        response = litellm.completion(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0,
-            api_key=os.environ.get("GEMINI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+
+def _extract_origin_category(html: str) -> str:
+    """Lấy giá trị cuối cùng từ <meta property="product:category" content="A>B>C"> → "C"."""
+    m = re.search(
+        r'<meta[^>]+property=["\']product:category["\'][^>]+content=["\']([^"\']+)["\']',
+        html, re.IGNORECASE
+    )
+    if not m:
+        m = re.search(
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']product:category["\']',
+            html, re.IGNORECASE
         )
-        # Log toàn bộ response để debug nếu không có content
-        raw_content = None
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            choice = response.choices[0]
-            if hasattr(choice, 'message') and hasattr(choice.message, 'content'):
-                raw_content = choice.message.content
-        
-        if raw_content is not None:
-            content = str(raw_content).strip()
-            match = re.search(r'\d+', content)
-            if match:
-                return int(match.group(0))
-        else:
-            print(f"[AI Category Warn] AI trả về đối tượng không hợp lệ cho URL: {product_url}")
-            print(f"Log từ LiteLLM object: {str(response)}")
-            
+    if m:
+        parts = m.group(1).split(">")
+        return parts[-1].strip()
+    return ""
+
+
+def predict_category_with_ai(product_url: str, html: str = "", market: str = "us") -> int:
+    """Gọi API batch-map để tự động detect Category ID từ tên sản phẩm và ảnh."""
+    DETECH_API = "https://backend-detech-category.prtvstatic.com/mapping/batch-map"
+    DETECH_HEADERS = {
+        "Content-Type": "application/json",
+        "Origin": "https://detech-category.prtvstatic.com",
+    }
+
+    try:
+        product_name = _extract_meta(html, "title")
+        if not product_name:
+            # fallback về title tag
+            m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+            product_name = m.group(1).strip() if m else product_url.split("/")[-1].replace("-", " ")
+
+        image = _extract_meta(html, "image")
+        market_name = _MARKET_NAME_MAP.get(market.lower(), "united states")
+
+        payload = {
+            "products": [
+                {
+                    "productName": product_name,
+                    "originCategory": _extract_origin_category(html),
+                    "market": market_name,
+                    "image": image,
+                }
+            ]
+        }
+        resp = requests.post(DETECH_API, json=payload, headers=DETECH_HEADERS, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("results", [])
+            if results:
+                cat_id = results[0].get("targetCategoryId")
+                if cat_id:
+                    print(f"[Detech Category] {product_url} → {results[0].get('targetCategoryName')} (id={cat_id})")
+                    return int(cat_id)
+        print(f"[Detech Category Warn] Không lấy được category, status={resp.status_code}")
     except Exception as e:
-        print(f"[AI Category Error] {product_url} -> {e}")
-    return 35 # Trả về 35 mặc định nếu cả AI cũng sụp lỗi (fallback an toàn cuối cùng)
+        print(f"[Detech Category Error] {product_url} -> {e}")
+    return 35
 
 
 async def auto_discover_callie_categories(website: str = "callie.com") -> list[str]:
@@ -648,11 +683,14 @@ def fetch_html(url: str, retries: int = 3) -> str | None:
     return None
 
 
-def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CATEGORIES, market: str = "us") -> dict:
-    # Chèn biến market vào sau printerval.com
-    api_url = PRINTERVAL_API.replace("printerval.com", f"printerval.com/{market}")
+def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CATEGORIES, market: str = "us", api_site: str = "250spirit") -> dict:
+    site_domain = api_site if "." in api_site else f"{api_site}.com"
+    api_url = f"https://{site_domain}/crawl-product/create-from-html?debug=1"
+    if api_site == "printerval":
+        api_url = api_url.replace("printerval.com", f"printerval.com/{market}")
 
     payload = {
+        "approve_advertising": 1,
         "brand_id": BRAND_ID,
         "categories": categories,
         "country_code": market,
@@ -677,7 +715,7 @@ def post_to_printerval(product_url: str, html: str, categories: int = DEFAULT_CA
     return {"status": 0, "body": "max retries"}
 
 
-def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list, categories: int = DEFAULT_CATEGORIES, market: str = "us"):
+def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list, categories: int = DEFAULT_CATEGORIES, market: str = "us", api_site: str = "250spirit"):
 
     html = fetch_html(url)
     if not html:
@@ -688,7 +726,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
     # Nếu Category được set là -1 (Tự động bởi AI) - Mặc định hiện tại luôn là -1
     final_category = categories
     if final_category == -1:
-        final_category = predict_category_with_ai(url)
+        final_category = predict_category_with_ai(url, html=html, market=market)
         
     # Bỏ qua không đăng nếu AI trả về giá trị -2
     if final_category == -2:
@@ -697,7 +735,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
             counters["skipped"] += 1
         return
 
-    result = post_to_printerval(url, html, categories=final_category, market=market)
+    result = post_to_printerval(url, html, categories=final_category, market=market, api_site=api_site)
     
     # --- DEBUG LOG ---
     try:
@@ -738,7 +776,7 @@ def process_one(url: str, counters: dict, lock: threading.Lock, done_links: list
 
 import queue
 
-def run_import_job(product_urls: list[str] | None, chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, market: str = "us", is_auto: bool = False):
+def run_import_job(product_urls: list[str] | None, chat_id: int, loop, bot, categories: int = DEFAULT_CATEGORIES, market: str = "us", api_site: str = "250spirit", is_auto: bool = False):
     """Chạy import trong background. Hỗ trợ queue cho luồng real-time stream"""
     job = active_jobs.get(chat_id, {})
     if product_urls is not None:
@@ -796,7 +834,7 @@ def run_import_job(product_urls: list[str] | None, chat_id: int, loop, bot, cate
                     break
                 continue
                 
-            process_one(url, counters, lock, done_links, categories=categories, market=market)
+            process_one(url, counters, lock, done_links, categories=categories, market=market, api_site=api_site)
             
             with lock:
                 done_now = counters["done"] + counters["failed"] + counters["skipped"]
@@ -984,7 +1022,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Không có job nào đang chạy.")
 
 
-async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES, website: str = "callie.com", market: str = "us", max_page: int = 200):
+async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, categories: int = DEFAULT_CATEGORIES, website: str = "callie.com", market: str = "us", max_page: int = 200, api_site: str = "250spirit"):
     """Logic chính: nhận URL → crawl → import"""
     chat_id = update.effective_chat.id
 
@@ -1003,7 +1041,8 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
         f"🌐 URL: `{url}`\n"
         f"🗂️ Category ID: `{categories}`\n"
         f"🌍 Website logic: `{website}`\n"
-        f"🇺🇸 Market: `{market}`\n\n"
+        f"🇺🇸 Market: `{market}`\n"
+        f"🖥️ API Site: `{api_site}.com`\n\n"
     )
     status_msg = await update.message.reply_text(
         f"{context_text}⏳ *Bước 1/3:* Đang mở browser & scroll trang...\n"
@@ -1041,6 +1080,7 @@ async def do_crawl(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str,
             "bot": context.bot,
             "categories": categories,
             "market": market,
+            "api_site": api_site,
             "is_auto": False
         },
         daemon=True
@@ -1147,7 +1187,7 @@ def build_crawling_url(keyword_or_url: str, website: str) -> (str, str):
     return url, website
 
 # ─── Conversation states cho /crawl wizard ────────────────────────────────────
-CRAWL_ASK_URL, CRAWL_ASK_WEBSITE, CRAWL_ASK_MARKET, CRAWL_ASK_CATEGORY, CRAWL_ASK_MAX_PAGE = range(5)
+CRAWL_ASK_URL, CRAWL_ASK_WEBSITE, CRAWL_ASK_MARKET, CRAWL_ASK_API_SITE, CRAWL_ASK_CATEGORY, CRAWL_ASK_MAX_PAGE = range(6)
 
 async def _reply(update: Update, text: str, retries: int = 3):
     """reply_text với retry khi bị TimedOut."""
@@ -1168,7 +1208,7 @@ async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data.clear()
     await _reply(update,
-        "🔗 *Bước 1/5 — URL hoặc từ khoá:*\n"
+        "🔗 *Bước 1/6 — URL hoặc từ khoá:*\n"
         "Nhập link danh sách sản phẩm hoặc từ khoá muốn tìm kiếm.\n"
         "_(Gõ /cancel để huỷ)_"
     )
@@ -1180,7 +1220,7 @@ async def crawl_got_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CRAWL_ASK_URL
     context.user_data["crawl_input"] = update.message.text.strip()
     await _reply(update,
-        "🌐 *Bước 2/5 — Website:*\n"
+        "🌐 *Bước 2/6 — Website:*\n"
         "Nhập tên website cần crawl.\n"
         "Ví dụ: `flagwix.com`, `callie.com`, `allegro.pl`\n"
         "_(Enter để dùng mặc định: `callie.com`)_"
@@ -1194,7 +1234,7 @@ async def crawl_got_website(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     context.user_data["crawl_website"] = text if text else "callie.com"
     await _reply(update,
-        "🏳️ *Bước 3/5 — Market:*\n"
+        "🏳️ *Bước 3/6 — Market:*\n"
         "Nhập mã thị trường (2 ký tự).\n"
         "Ví dụ: `us`, `uk`, `pl`\n"
         "_(Enter để dùng mặc định: `us`)_"
@@ -1208,7 +1248,21 @@ async def crawl_got_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().lower()
     context.user_data["crawl_market"] = text if text else "us"
     await _reply(update,
-        "🗂️ *Bước 4/5 — Category ID:*\n"
+        "🖥️ *Bước 4/6 — API Site:*\n"
+        "Nhập tên site để gửi sản phẩm lên.\n"
+        "Ví dụ: `printerval`, `printblur`, `250spirit`\n"
+        "_(Enter để dùng mặc định: `250spirit`)_"
+    )
+    return CRAWL_ASK_API_SITE
+
+
+async def crawl_got_api_site(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return CRAWL_ASK_API_SITE
+    text = update.message.text.strip().lower()
+    context.user_data["crawl_api_site"] = text if text else "250spirit"
+    await _reply(update,
+        "🗂️ *Bước 5/6 — Category ID:*\n"
         "Nhập ID danh mục sản phẩm.\n"
         "_(Enter để dùng mặc định: `-1` — AI tự động phân loại)_"
     )
@@ -1231,7 +1285,7 @@ async def crawl_got_category(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if is_flagwix:
         await _reply(update,
-            "📄 *Bước 5/5 — Page lớn nhất (flagwix):*\n"
+            "📄 *Bước 6/6 — Page lớn nhất (flagwix):*\n"
             "Nhập số trang lớn nhất để bắt đầu crawl từ đó xuống trang 1.\n"
             "_(Enter để dùng mặc định: `200`)_"
         )
@@ -1258,11 +1312,12 @@ async def crawl_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     crawl_input = context.user_data.get("crawl_input", "")
     website     = context.user_data.get("crawl_website", "callie.com")
     market      = context.user_data.get("crawl_market", "us")
+    api_site    = context.user_data.get("crawl_api_site", "250spirit")
     categories  = context.user_data.get("crawl_categories", -1)
     max_page    = context.user_data.get("crawl_max_page", 200)
 
     url, website = build_crawling_url(crawl_input, website)
-    await do_crawl(update, context, url, categories=categories, website=website, market=market, max_page=max_page)
+    await do_crawl(update, context, url, categories=categories, website=website, market=market, max_page=max_page, api_site=api_site)
     return ConversationHandler.END
 
 
@@ -1457,6 +1512,7 @@ def main():
             CRAWL_ASK_URL:      [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_url)],
             CRAWL_ASK_WEBSITE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_website)],
             CRAWL_ASK_MARKET:   [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_market)],
+            CRAWL_ASK_API_SITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_api_site)],
             CRAWL_ASK_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_category)],
             CRAWL_ASK_MAX_PAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, crawl_got_max_page)],
         },
