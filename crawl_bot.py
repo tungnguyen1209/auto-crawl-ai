@@ -1505,7 +1505,15 @@ def main():
     print(f"📦 Đã tải {len(crawled_urls)} URL đã crawl từ trước.")
     print(f"🔑 Token: {TELEGRAM_BOT_TOKEN[:20]}...")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .build()
+    )
     crawl_conv = ConversationHandler(
         entry_points=[CommandHandler("crawl", crawl_command)],
         states={
