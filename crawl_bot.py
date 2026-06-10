@@ -176,7 +176,7 @@ def predict_category_with_ai(product_url: str, html: str = "", market: str = "us
             "products": [
                 {
                     "name": product_name,
-                    "originCategory": _extract_origin_category(html),
+                    # "originCategory": "",
                     "image": image,
                 }
             ]
