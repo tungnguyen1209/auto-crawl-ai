@@ -182,7 +182,7 @@ def predict_category_with_ai(product_url: str, html: str = "", market: str = "us
             ]
         }
         resp = requests.post(DETECH_API, json=payload, headers=DETECH_HEADERS, timeout=30)
-        if resp.status_code == 200:
+        if resp.status_code == 200 or resp.status_code == 201:
             data = resp.json()
             results = data.get("results", [])
             if results:
