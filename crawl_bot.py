@@ -140,7 +140,7 @@ def _extract_meta(html: str, property_name: str) -> str:
 
 
 def _extract_origin_category(html: str) -> str:
-    """Lấy giá trị cuối cùng từ <meta property="product:category" content="A>B>C"> → "C"."""
+    """Lấy full path từ <meta property="product:category" content="A>B>C">."""
     m = re.search(
         r'<meta[^>]+property=["\']product:category["\'][^>]+content=["\']([^"\']+)["\']',
         html, re.IGNORECASE
@@ -151,8 +151,7 @@ def _extract_origin_category(html: str) -> str:
             html, re.IGNORECASE
         )
     if m:
-        parts = m.group(1).split(">")
-        return parts[-1].strip()
+        return m.group(1).strip()
     return ""
 
 
@@ -172,14 +171,12 @@ def predict_category_with_ai(product_url: str, html: str = "", market: str = "us
             product_name = m.group(1).strip() if m else product_url.split("/")[-1].replace("-", " ")
 
         image = _extract_meta(html, "image")
-        market_name = _MARKET_NAME_MAP.get(market.lower(), "united states")
 
         payload = {
             "products": [
                 {
-                    "productName": product_name,
+                    "name": product_name,
                     "originCategory": _extract_origin_category(html),
-                    "market": market_name,
                     "image": image,
                 }
             ]
